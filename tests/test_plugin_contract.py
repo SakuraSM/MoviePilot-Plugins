@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+import types
+import unittest
+
+import _bootstrap
+
+
+def install_moviepilot_stubs() -> None:
+    class BaseModel:
+        pass
+
+    class PluginBase:
+        def __init__(self):
+            self._data = {}
+
+        def save_data(self, key, value):
+            self._data[key] = value
+
+        def get_data(self, key):
+            return self._data.get(key)
+
+        def post_message(self, **_kwargs):
+            return None
+
+    class Event:
+        event_data = {}
+
+    class EventManager:
+        @staticmethod
+        def register(_event_type):
+            return lambda function: function
+
+    class MediaServerHelper:
+        @staticmethod
+        def get_configs():
+            return {}
+
+    logger = types.SimpleNamespace(error=lambda *_a, **_k: None, warning=lambda *_a, **_k: None)
+    logger.exception = lambda *_a, **_k: None
+    event_type = types.SimpleNamespace(TransferComplete="TransferComplete")
+
+    modules = {
+        "pydantic": types.SimpleNamespace(BaseModel=BaseModel),
+        "app": types.ModuleType("app"),
+        "app.core": types.ModuleType("app.core"),
+        "app.core.event": types.SimpleNamespace(Event=Event, eventmanager=EventManager()),
+        "app.helper": types.ModuleType("app.helper"),
+        "app.helper.mediaserver": types.SimpleNamespace(MediaServerHelper=MediaServerHelper),
+        "app.log": types.SimpleNamespace(logger=logger),
+        "app.plugins": types.SimpleNamespace(_PluginBase=PluginBase),
+        "app.schemas": types.ModuleType("app.schemas"),
+        "app.schemas.types": types.SimpleNamespace(EventType=event_type),
+    }
+    for name, module in modules.items():
+        sys.modules.setdefault(name, module)
+
+
+class PluginContractTests(unittest.TestCase):
+    def test_moviepilot_v2_contract(self) -> None:
+        install_moviepilot_stubs()
+        path = _bootstrap.PLUGIN_DIR / "__init__.py"
+        spec = importlib.util.spec_from_file_location("clouddriveplexsync.entry", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        plugin = module.CloudDrivePlexSync()
+        form, defaults = plugin.get_form()
+        apis = plugin.get_api()
+
+        self.assertEqual(plugin.plugin_version, "1.0.0")
+        self.assertEqual(len(apis), 7)
+        self.assertTrue(all(item["auth"] == "bear" for item in apis))
+        self.assertEqual(defaults["buffer_mode"], "adaptive")
+        self.assertEqual(defaults["buffer_min_mb"], 1)
+        self.assertEqual(form[0]["component"], "VForm")
+
+
+if __name__ == "__main__":
+    unittest.main()
