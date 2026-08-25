@@ -123,6 +123,7 @@ class PluginStats:
     buffer_changes: int = 0
     ttd_poll_requests: int = 0
     ttd_records: int = 0
+    ttd_skipped_records: int = 0
     ttd_auth_failures: int = 0
     ttd_errors: int = 0
 
