@@ -80,7 +80,7 @@ class PluginContractTests(unittest.TestCase):
         form, defaults = plugin.get_form()
         apis = plugin.get_api()
 
-        self.assertEqual(plugin.plugin_version, "1.2.0")
+        self.assertEqual(plugin.plugin_version, "1.3.0")
         self.assertEqual(len(apis), 7)
         self.assertTrue(all(item["auth"] == "bear" for item in apis))
         self.assertEqual(defaults["buffer_mode"], "adaptive")
@@ -88,6 +88,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertFalse(defaults["enable_ttd"])
         self.assertEqual(defaults["ttd_initial_mode"], "baseline")
         self.assertEqual(defaults["ttd_unmatched_policy"], "skip")
+        self.assertEqual(
+            defaults["cloud_plex_path_overrides"],
+            "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya",
+        )
         self.assertEqual(form[0]["component"], "VForm")
         components = []
         models = []
@@ -200,6 +204,55 @@ class PluginContractTests(unittest.TestCase):
 
         self.assertEqual(result.state.value, "retry")
         self.assertIn("no mounted CloudDrive path", result.reason)
+
+    def test_ttd_refreshes_only_the_exact_target_directory(self) -> None:
+        module = load_plugin_module()
+        root = "/光鸭云盘/Media/Video/已整理"
+        target = f"{root}/电影/片名"
+
+        class Mapper:
+            @staticmethod
+            def validate_cloud_path(path):
+                return path
+
+            @staticmethod
+            def cloud_to_plex(_path):
+                return "/data/CloudNas/Guangya/电影/片名"
+
+        class Worker:
+            mapper = Mapper()
+
+            @staticmethod
+            def has_pending_cloud_directory(_path):
+                return False
+
+            @staticmethod
+            def submit_scan_directory(_path, _source):
+                return True
+
+        class Plex:
+            @staticmethod
+            def find_target(_path):
+                return object()
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            async def force_list(self, path):
+                self.calls.append(path)
+
+        plugin = module.CloudDrivePlexSync()
+        plugin._worker = Worker()
+        plugin._plex = Plex()
+        plugin._client = Client()
+        plugin._watch_roots = [root]
+        plugin._ttd_force_refresh = True
+
+        result = asyncio.run(plugin._submit_ttd_directory(target, "ttd"))
+
+        self.assertEqual(result.state.value, "queued")
+        self.assertEqual(plugin._client.calls, [target])
 
 
 if __name__ == "__main__":

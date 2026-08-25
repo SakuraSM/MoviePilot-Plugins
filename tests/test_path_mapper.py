@@ -42,6 +42,35 @@ class PathMapperTests(unittest.TestCase):
             "/光鸭云盘/Media/Video/已整理/电影/片名",
         )
 
+    def test_direct_cloud_to_plex_mapping_does_not_require_mounts(self) -> None:
+        mapper = PathMapper(
+            watch_roots=["/光鸭云盘/Media/Video/已整理"],
+            mounts=[],
+            plex_overrides=[],
+            cloud_plex_overrides=parse_override_lines(
+                "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya"
+            ),
+        )
+
+        self.assertEqual(
+            mapper.cloud_to_plex(
+                "/光鸭云盘/Media/Video/已整理/动漫/国产动漫/片名"
+            ),
+            "/data/CloudNas/Guangya/动漫/国产动漫/片名",
+        )
+
+    def test_direct_cloud_to_plex_mapping_takes_priority_over_mount_fallback(self) -> None:
+        self.mapper.cloud_plex_overrides = parse_override_lines(
+            "/光鸭云盘/Media/Video/已整理 => /data/Direct"
+        )
+
+        self.assertEqual(
+            self.mapper.cloud_to_plex(
+                "/光鸭云盘/Media/Video/已整理/电影/片名"
+            ),
+            "/data/Direct/电影/片名",
+        )
+
     def test_moviepilot_path_reverses_to_cloud(self) -> None:
         self.assertEqual(
             self.mapper.moviepilot_to_cloud(

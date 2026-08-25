@@ -82,11 +82,15 @@ class PathMapper:
     watch_roots: Sequence[str]
     mounts: Sequence[MountPoint]
     plex_overrides: Sequence[Tuple[str, str]]
+    cloud_plex_overrides: Sequence[Tuple[str, str]] = ()
     moviepilot_overrides: Sequence[Tuple[str, str]] = ()
 
     def __post_init__(self) -> None:
         self.watch_roots = [normalize_path(item) for item in self.watch_roots]
         self.plex_overrides = sorted(self.plex_overrides, key=lambda item: len(item[0]), reverse=True)
+        self.cloud_plex_overrides = sorted(
+            self.cloud_plex_overrides, key=lambda item: len(item[0]), reverse=True
+        )
         self.moviepilot_overrides = sorted(
             self.moviepilot_overrides, key=lambda item: len(item[0]), reverse=True
         )
@@ -126,6 +130,9 @@ class PathMapper:
         return replace_prefix(path, source, target)
 
     def cloud_to_plex(self, cloud_path: str) -> str:
+        cloud_path = self.validate_cloud_path(cloud_path)
+        if any(is_under(cloud_path, source) for source, _ in self.cloud_plex_overrides):
+            return self._apply_override(cloud_path, self.cloud_plex_overrides)
         return self._apply_override(self.cloud_to_mount(cloud_path), self.plex_overrides)
 
     def cloud_scan_directory(self, cloud_path: str) -> str:

@@ -52,7 +52,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "CloudDrive Plex 增量同步"
     plugin_desc = "通过 CloudDrive2 推送或 TgToDrive 整理历史触发 Plex 局部扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"
@@ -67,6 +67,7 @@ class CloudDrivePlexSync(_PluginBase):
     _plex_sections: List[str] = []
     _watch_roots: List[str] = []
     _plex_overrides: List[Tuple[str, str]] = []
+    _cloud_plex_overrides: List[Tuple[str, str]] = []
     _moviepilot_overrides: List[Tuple[str, str]] = []
     _enable_push = True
     _enable_transfer_event = True
@@ -155,6 +156,9 @@ class CloudDrivePlexSync(_PluginBase):
             buffer_min_mb = max(1, int(config.get("buffer_min_mb") or 1))
             self._watch_roots = parse_roots(config.get("watch_roots"))
             self._plex_overrides = parse_override_lines(config.get("plex_path_overrides"))
+            self._cloud_plex_overrides = parse_override_lines(
+                config.get("cloud_plex_path_overrides")
+            )
             self._moviepilot_overrides = parse_override_lines(
                 config.get("moviepilot_path_overrides")
             )
@@ -347,6 +351,7 @@ class CloudDrivePlexSync(_PluginBase):
             watch_roots=self._watch_roots,
             mounts=self._mounts,
             plex_overrides=self._plex_overrides,
+            cloud_plex_overrides=self._cloud_plex_overrides,
             moviepilot_overrides=self._moviepilot_overrides,
         )
 
@@ -832,9 +837,18 @@ class CloudDrivePlexSync(_PluginBase):
                 ),
                 field(
                     "VTextarea",
+                    "cloud_plex_path_overrides",
+                    "CD2 云端路径 → Plex 路径（推荐）",
+                    "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya",
+                    hint="优先使用，不依赖 CD2 挂载目录结构；按最长路径前缀匹配。",
+                    md=12,
+                ),
+                field(
+                    "VTextarea",
                     "plex_path_overrides",
-                    "Plex 路径映射",
+                    "CD2 挂载路径 → Plex 路径（兼容）",
                     "/CloudNAS/Guangya => /data/CloudNas/Guangya",
+                    hint="仅在云端直连映射未命中时，通过 CD2 MountPoint 推导后使用。",
                     md=12,
                 ),
                 field(
@@ -965,6 +979,9 @@ class CloudDrivePlexSync(_PluginBase):
             "plex_server": "",
             "plex_sections": "",
             "watch_roots": "/光鸭云盘/Media/Video/已整理",
+            "cloud_plex_path_overrides": (
+                "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya"
+            ),
             "plex_path_overrides": "/CloudNAS/Guangya => /data/CloudNas/Guangya",
             "moviepilot_path_overrides": "",
             "debounce_seconds": 30,
