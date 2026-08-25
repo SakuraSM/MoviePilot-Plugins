@@ -28,7 +28,7 @@ from .path_mapper import (
     parse_override_lines,
     parse_roots,
 )
-from .plex_bridge import PlexBridge
+from .plex_bridge import PlexBridge, PlexLibraryNotFoundError
 from .ttd_client import (
     TTDClient,
     TTDCursor,
@@ -488,9 +488,11 @@ class CloudDrivePlexSync(_PluginBase):
                 return TTDSubmitResult.skipped(f"命中配置的跳过路径 {skipped_prefix}")
             plex_path = self._worker.mapper.cloud_to_plex(path)
             self._plex.find_target(plex_path)
-        except PathMappingError as exc:
+        except PlexLibraryNotFoundError as exc:
             if self._ttd_unmatched_policy == "skip":
                 return TTDSubmitResult.skipped(str(exc))
+            return TTDSubmitResult.retry(str(exc))
+        except PathMappingError as exc:
             return TTDSubmitResult.retry(str(exc))
         except Exception as exc:
             return TTDSubmitResult.retry(f"Plex 路径检查失败：{exc}")

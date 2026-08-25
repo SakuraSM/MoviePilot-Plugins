@@ -11,6 +11,10 @@ from .path_mapper import PathMappingError, is_under, normalize_path
 MINIMUM_PLEX_VERSION = (1, 20, 0, 3125)
 
 
+class PlexLibraryNotFoundError(PathMappingError):
+    """Raised when a valid Plex path belongs to none of the selected libraries."""
+
+
 def parse_plex_version(value: str) -> Tuple[int, ...]:
     numeric = (value or "").split("-", 1)[0]
     parts: List[int] = []
@@ -91,7 +95,7 @@ class PlexBridge:
                         )
                     )
         if not candidates:
-            raise PathMappingError(f"no selected Plex library contains {path}")
+            raise PlexLibraryNotFoundError(f"no selected Plex library contains {path}")
         best_length = max(item[0] for item in candidates)
         best = [item for item in candidates if item[0] == best_length]
         identities = {(item[1], item[3]) for item in best}

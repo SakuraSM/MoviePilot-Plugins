@@ -144,7 +144,9 @@ class PluginContractTests(unittest.TestCase):
         class Plex:
             @staticmethod
             def find_target(path):
-                raise module.PathMappingError(f"no selected Plex library contains {path}")
+                raise module.PlexLibraryNotFoundError(
+                    f"no selected Plex library contains {path}"
+                )
 
         class Client:
             def __init__(self):
@@ -168,6 +170,36 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(result.state.value, "skipped")
         self.assertIn("no selected Plex library", result.reason)
         self.assertEqual(plugin._client.calls, [])
+
+    def test_ttd_mapping_failure_is_retried_even_when_unmatched_paths_are_skipped(self) -> None:
+        module = load_plugin_module()
+
+        class Mapper:
+            @staticmethod
+            def validate_cloud_path(path):
+                return path
+
+            @staticmethod
+            def cloud_to_plex(path):
+                raise module.PathMappingError(f"no mounted CloudDrive path matches {path}")
+
+        class Worker:
+            mapper = Mapper()
+
+        plugin = module.CloudDrivePlexSync()
+        plugin._worker = Worker()
+        plugin._plex = object()
+        plugin._client = object()
+        plugin._ttd_unmatched_policy = "skip"
+
+        result = asyncio.run(
+            plugin._submit_ttd_directory(
+                "/光鸭云盘/Media/Video/已整理/电影/片名", "ttd"
+            )
+        )
+
+        self.assertEqual(result.state.value, "retry")
+        self.assertIn("no mounted CloudDrive path", result.reason)
 
 
 if __name__ == "__main__":
