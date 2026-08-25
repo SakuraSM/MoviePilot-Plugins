@@ -18,7 +18,7 @@ MoviePilot 会读取仓库 `main` 分支的 `package.v2.json`，并将其中的�
 
 | 插件 ID | 名称 | 版本 | 说明 |
 |---|---|---:|---|
-| `CloudDrivePlexSync` | CloudDrive Plex 增量同步 | 1.0.0 | 订阅 CD2 Pro 文件变化并触发 Plex 指定目录扫描 |
+| `CloudDrivePlexSync` | CloudDrive Plex 增量同步 | 1.1.0 | 订阅 CD2 Pro 文件变化或 TTD 整理历史并触发 Plex 指定目录扫描 |
 
 详细配置见
 [`plugins.v2/clouddriveplexsync/README.md`](plugins.v2/clouddriveplexsync/README.md)。

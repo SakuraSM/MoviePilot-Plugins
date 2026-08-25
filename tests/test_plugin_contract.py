@@ -71,11 +71,13 @@ class PluginContractTests(unittest.TestCase):
         form, defaults = plugin.get_form()
         apis = plugin.get_api()
 
-        self.assertEqual(plugin.plugin_version, "1.0.0")
+        self.assertEqual(plugin.plugin_version, "1.1.0")
         self.assertEqual(len(apis), 7)
         self.assertTrue(all(item["auth"] == "bear" for item in apis))
         self.assertEqual(defaults["buffer_mode"], "adaptive")
         self.assertEqual(defaults["buffer_min_mb"], 1)
+        self.assertFalse(defaults["enable_ttd"])
+        self.assertEqual(defaults["ttd_initial_mode"], "baseline")
         self.assertEqual(form[0]["component"], "VForm")
 
 
