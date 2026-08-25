@@ -29,7 +29,13 @@ from .path_mapper import (
     parse_roots,
 )
 from .plex_bridge import PlexBridge
-from .ttd_client import TTDClient, TTDCursor, TTDHistoryPoller
+from .ttd_client import (
+    TTDClient,
+    TTDCursor,
+    TTDHistoryPoller,
+    TTDSubmitResult,
+    parse_ttd_skip_paths,
+)
 
 
 class ResyncRequest(BaseModel):
@@ -46,7 +52,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "CloudDrive Plex 增量同步"
     plugin_desc = "通过 CloudDrive2 推送或 TgToDrive 整理历史触发 Plex 局部扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"
@@ -74,6 +80,8 @@ class CloudDrivePlexSync(_PluginBase):
     _ttd_max_pages = 5
     _ttd_initial_mode = "baseline"
     _ttd_force_refresh = True
+    _ttd_skip_paths: List[str] = []
+    _ttd_unmatched_policy = "skip"
     _notify_errors = True
     _debounce_seconds = 30
     _queue_capacity = 10_000
@@ -135,6 +143,9 @@ class CloudDrivePlexSync(_PluginBase):
         self._ttd_max_pages = max(1, min(20, int(config.get("ttd_max_pages") or 5)))
         self._ttd_initial_mode = str(config.get("ttd_initial_mode") or "baseline").strip()
         self._ttd_force_refresh = bool(config.get("ttd_force_refresh", True))
+        self._ttd_unmatched_policy = str(
+            config.get("ttd_unmatched_policy") or "skip"
+        ).strip().lower()
         self._notify_errors = bool(config.get("notify_errors", True))
         self._debounce_seconds = max(0, int(config.get("debounce_seconds") or 30))
         self._queue_capacity = max(1, int(config.get("queue_capacity") or 10_000))
@@ -151,12 +162,17 @@ class CloudDrivePlexSync(_PluginBase):
             self._ttd_target_root = normalize_path(
                 configured_ttd_root or (self._watch_roots[0] if self._watch_roots else "/")
             )
+            self._ttd_skip_paths = parse_ttd_skip_paths(
+                config.get("ttd_skip_paths"), self._ttd_target_root
+            )
             if self._watch_roots and not any(
                 is_under(self._ttd_target_root, root) for root in self._watch_roots
             ):
                 raise PathMappingError("TTD 目标根目录必须位于某个 CD2 监听根目录内")
             if self._ttd_initial_mode not in {"baseline", "replay_latest"}:
                 raise ValueError("TTD 首次运行模式只能是 baseline 或 replay_latest")
+            if self._ttd_unmatched_policy not in {"skip", "retry"}:
+                raise ValueError("TTD 未匹配 Plex 路径策略只能是 skip 或 retry")
             if self._enable_ttd and self._ttd_url:
                 parsed_ttd_url = urlsplit(self._ttd_url)
                 if parsed_ttd_url.scheme not in {"http", "https"} or not parsed_ttd_url.netloc:
@@ -298,6 +314,7 @@ class CloudDrivePlexSync(_PluginBase):
                     cursor=TTDCursor.from_dict(self.get_data("ttd_cursor")),
                     persist_cursor=self._persist_ttd_cursor,
                     on_error=self._set_error,
+                    on_skip=self._record_info,
                     stats=self._stats,
                 )
             self._ready.set()
@@ -455,17 +472,35 @@ class CloudDrivePlexSync(_PluginBase):
         except Exception as exc:
             self._set_error(f"MoviePilot 入库事件处理失败：{exc}")
 
-    async def _submit_ttd_directory(self, cloud_directory: str, source: str) -> bool:
+    async def _submit_ttd_directory(
+        self, cloud_directory: str, source: str
+    ) -> TTDSubmitResult:
         """Refresh one exact CD2 directory, then enqueue its Plex path."""
 
-        if not self._worker or not self._client:
-            return False
-        path = self._worker.mapper.validate_cloud_path(cloud_directory)
+        if not self._worker or not self._client or not self._plex:
+            return TTDSubmitResult.retry("插件后台组件尚未就绪")
+        try:
+            path = self._worker.mapper.validate_cloud_path(cloud_directory)
+            skipped_prefix = next(
+                (item for item in self._ttd_skip_paths if is_under(path, item)), None
+            )
+            if skipped_prefix:
+                return TTDSubmitResult.skipped(f"命中配置的跳过路径 {skipped_prefix}")
+            plex_path = self._worker.mapper.cloud_to_plex(path)
+            self._plex.find_target(plex_path)
+        except PathMappingError as exc:
+            if self._ttd_unmatched_policy == "skip":
+                return TTDSubmitResult.skipped(str(exc))
+            return TTDSubmitResult.retry(str(exc))
+        except Exception as exc:
+            return TTDSubmitResult.retry(f"Plex 路径检查失败：{exc}")
         pushed_at = self._recent_push_dirs.get(path, 0)
         if time.time() - pushed_at <= 120:
             if self._worker.has_pending_cloud_directory(path):
-                return self._worker.submit_scan_directory(path, source)
-            return True
+                if self._worker.submit_scan_directory(path, source):
+                    return TTDSubmitResult.queued("已与 CD2 推送任务合并")
+                return TTDSubmitResult.retry("扫描队列暂未接受目标目录")
+            return TTDSubmitResult.queued("近期 CD2 推送已覆盖该目录")
         if self._ttd_force_refresh:
             try:
                 await self._client.force_list(path)
@@ -475,7 +510,8 @@ class CloudDrivePlexSync(_PluginBase):
         queued = self._worker.submit_scan_directory(path, source)
         if queued:
             self._recent_ttd_dirs[path] = time.time()
-        return queued
+            return TTDSubmitResult.queued()
+        return TTDSubmitResult.retry("扫描队列暂未接受目标目录")
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
@@ -507,6 +543,12 @@ class CloudDrivePlexSync(_PluginBase):
                 self.post_message(title="CloudDrive Plex 增量同步", text=str(message))
             except Exception:
                 pass
+
+    def _record_info(self, message: str) -> None:
+        logger.info(f"[CloudDrivePlexSync] {message}")
+        worker = self._worker
+        if worker:
+            worker.recent.append(f"SKIP {message}")
 
     def _submit(self, coroutine: Any, timeout: float = 30.0) -> Any:
         if not self._loop or not self._loop.is_running():
@@ -664,46 +706,22 @@ class CloudDrivePlexSync(_PluginBase):
             return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        fields = [
-            ("VSwitch", "enabled", "启用插件", None),
-            ("VTextField", "cd2_url", "CloudDrive2 地址", "http://NAS_IP:19798"),
-            ("VTextField", "cd2_token", "CloudDrive2 API Token", None),
-            ("VSelect", "plex_server", "Plex 服务", None),
-            ("VTextField", "plex_sections", "允许的 Plex 媒体库 ID（逗号分隔）", None),
-            ("VTextarea", "watch_roots", "CD2 监听根目录（每行一个）", "/光鸭云盘/Media/Video/已整理"),
-            ("VTextarea", "plex_path_overrides", "Plex 路径映射", "/CloudNAS/Guangya => /data/CloudNas/Guangya"),
-            ("VTextarea", "moviepilot_path_overrides", "MoviePilot 路径映射（可选）", None),
-            ("VTextField", "debounce_seconds", "防抖秒数", "30"),
-            ("VSelect", "buffer_mode", "Buffer 联动模式", None),
-            ("VTextField", "buffer_min_mb", "Buffer 最小值（MB）", "1"),
-            ("VTextField", "scan_buffer_mb", "空闲扫描 Buffer（MB）", "2"),
-            ("VTextField", "playback_scan_buffer_mb", "播放期间扫描 Buffer（MB）", "8"),
-            ("VTextarea", "buffer_overrides", "网盘级 Buffer 覆盖", "光鸭云盘|2|8"),
-            ("VTextField", "buffer_restore_grace_seconds", "扫描结束恢复延迟（秒）", "60"),
-            ("VTextField", "buffer_max_lease_minutes", "最大 Buffer 租约（分钟）", "15"),
-            ("VSwitch", "buffer_apply_before_scan", "扫描前应用 Buffer", None),
-            ("VSwitch", "buffer_restore_enabled", "扫描后恢复 Buffer", None),
-            ("VSwitch", "buffer_fail_open", "Buffer 修改失败时仍执行扫描", None),
-            ("VSwitch", "enable_push", "启用 CD2 推送", None),
-            ("VSwitch", "enable_transfer_event", "启用 MoviePilot 入库事件", None),
-            ("VSwitch", "enable_ttd", "启用 TgToDrive 整理历史轮询", None),
-            ("VTextField", "ttd_url", "TgToDrive 地址", "https://ttd.example.com"),
-            ("VTextField", "ttd_cookie", "TgToDrive 登录 Cookie", "session=..."),
-            ("VTextField", "ttd_source", "TgToDrive 来源筛选", "光鸭云盘"),
-            ("VTextField", "ttd_target_root", "TgToDrive 目标根目录", "/光鸭云盘/Media/Video/已整理"),
-            ("VTextField", "ttd_poll_seconds", "TgToDrive 轮询间隔（秒）", "30"),
-            ("VTextField", "ttd_page_size", "TgToDrive 每页记录数", "20"),
-            ("VTextField", "ttd_max_pages", "TgToDrive 最大补页数", "5"),
-            ("VSelect", "ttd_initial_mode", "TgToDrive 首次运行", None),
-            ("VSwitch", "ttd_force_refresh", "扫描前刷新准确的 CD2 目标目录", None),
-            ("VSwitch", "verify_tls", "验证 HTTPS 证书", None),
-            ("VSwitch", "notify_errors", "错误通知", None),
-        ]
-        content = []
-        for component, model, label, placeholder in fields:
+        def field(
+            component: str,
+            model: str,
+            label: str,
+            placeholder: Optional[str] = None,
+            *,
+            hint: Optional[str] = None,
+            cols: int = 12,
+            md: int = 6,
+        ) -> Dict[str, Any]:
             props: Dict[str, Any] = {"model": model, "label": label}
             if placeholder:
                 props["placeholder"] = placeholder
+            if hint:
+                props["hint"] = hint
+                props["persistent-hint"] = True
             if model in {"cd2_token", "ttd_cookie"}:
                 props["type"] = "password"
             if model == "plex_server":
@@ -718,6 +736,11 @@ class CloudDrivePlexSync(_PluginBase):
                 props["items"] = [
                     {"title": "仅建立基线，不处理历史", "value": "baseline"},
                     {"title": "处理当前最新记录", "value": "replay_latest"},
+                ]
+            if model == "ttd_unmatched_policy":
+                props["items"] = [
+                    {"title": "跳过并推进游标（推荐）", "value": "skip"},
+                    {"title": "保留记录并持续重试", "value": "retry"},
                 ]
             if model.startswith("ttd_") and model != "enable_ttd":
                 props["show"] = "{{ enable_ttd }}"
@@ -744,14 +767,194 @@ class CloudDrivePlexSync(_PluginBase):
                 "ttd_poll_seconds",
                 "ttd_page_size",
                 "ttd_max_pages",
+                "queue_capacity",
+                "scans_per_second",
             }:
                 props["type"] = "number"
                 props["min"] = 1
             if model == "ttd_poll_seconds":
                 props["min"] = 10
-            content.append(
-                {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": component, "props": props}]}]}
-            )
+            if model == "scans_per_second":
+                props["min"] = 0.1
+                props["step"] = 0.1
+            return {
+                "component": "VCol",
+                "props": {"cols": cols, "md": md},
+                "content": [{"component": component, "props": props}],
+            }
+
+        def rows(*items: Dict[str, Any]) -> List[Dict[str, Any]]:
+            result: List[Dict[str, Any]] = []
+            current: List[Dict[str, Any]] = []
+            for item in items:
+                current.append(item)
+                if sum(int(value["props"].get("md", 12)) for value in current) >= 12:
+                    result.append({"component": "VRow", "content": current})
+                    current = []
+            if current:
+                result.append({"component": "VRow", "content": current})
+            return result
+
+        basic = rows(
+            field("VTextField", "cd2_url", "CloudDrive2 地址", "http://NAS_IP:19798"),
+            field(
+                "VTextField",
+                "cd2_token",
+                "CloudDrive2 API Token",
+                hint="需要 Push Messages、Get Mounts、List Files、Get/Modify Cloud APIs 权限。",
+            ),
+            field("VSelect", "plex_server", "Plex 服务"),
+            field(
+                "VTextField",
+                "plex_sections",
+                "允许的 Plex 媒体库 ID（逗号分隔）",
+                hint="只会扫描这些媒体库；路径不匹配时绝不退化为整库扫描。",
+            ),
+        )
+        paths = [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "text": "监听根目录填写 CD2 云端路径；Plex 路径只填写在路径映射中。",
+                },
+            },
+            *rows(
+                field(
+                    "VTextarea",
+                    "watch_roots",
+                    "CD2 监听根目录（每行一个）",
+                    "/光鸭云盘/Media/Video/已整理",
+                    md=12,
+                ),
+                field(
+                    "VTextarea",
+                    "plex_path_overrides",
+                    "Plex 路径映射",
+                    "/CloudNAS/Guangya => /data/CloudNas/Guangya",
+                    md=12,
+                ),
+                field(
+                    "VTextarea",
+                    "moviepilot_path_overrides",
+                    "MoviePilot 路径映射（可选）",
+                    md=12,
+                ),
+                field("VTextField", "debounce_seconds", "防抖秒数", "30", md=4),
+                field("VSwitch", "enable_push", "启用 CD2 推送", md=4),
+                field(
+                    "VSwitch", "enable_transfer_event", "启用 MoviePilot 入库事件", md=4
+                ),
+            ),
+        ]
+        ttd = [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "text": "目标根目录必须是 CD2 云端路径，例如 /光鸭云盘/Media/Video/已整理。",
+                },
+            },
+            *rows(
+                field("VSwitch", "enable_ttd", "启用 TgToDrive 整理历史轮询", md=12),
+                field("VTextField", "ttd_url", "TgToDrive 地址", "https://ttd.example.com"),
+                field("VTextField", "ttd_cookie", "TgToDrive 登录 Cookie", "session=..."),
+                field("VTextField", "ttd_source", "TgToDrive 来源筛选", "光鸭云盘"),
+                field(
+                    "VTextField",
+                    "ttd_target_root",
+                    "TgToDrive 目标根目录（CD2 云端路径）",
+                    "/光鸭云盘/Media/Video/已整理",
+                ),
+                field(
+                    "VTextarea",
+                    "ttd_skip_paths",
+                    "TgToDrive 跳过路径（每行一个）",
+                    "待整理-通用\n_整理中",
+                    hint="支持相对目标根目录或绝对 CD2 路径；命中后只记录一次并推进游标。",
+                    md=12,
+                ),
+                field(
+                    "VSelect",
+                    "ttd_unmatched_policy",
+                    "不属于所选 Plex 媒体库时",
+                    hint="推荐跳过，避免永久不匹配的记录阻塞后续入库。",
+                ),
+                field("VSelect", "ttd_initial_mode", "TgToDrive 首次运行"),
+                field("VTextField", "ttd_poll_seconds", "轮询间隔（秒）", "30", md=4),
+                field("VTextField", "ttd_page_size", "每页记录数", "20", md=4),
+                field("VTextField", "ttd_max_pages", "最大补页数", "5", md=4),
+                field(
+                    "VSwitch", "ttd_force_refresh", "扫描前刷新准确的 CD2 目标目录", md=12
+                ),
+            ),
+        ]
+        buffer = rows(
+            field("VSelect", "buffer_mode", "Buffer 联动模式", md=12),
+            field("VTextField", "buffer_min_mb", "Buffer 最小值（MB）", "1", md=4),
+            field("VTextField", "scan_buffer_mb", "空闲扫描 Buffer（MB）", "2", md=4),
+            field(
+                "VTextField",
+                "playback_scan_buffer_mb",
+                "播放期间扫描 Buffer（MB）",
+                "8",
+                md=4,
+            ),
+            field(
+                "VTextarea",
+                "buffer_overrides",
+                "网盘级 Buffer 覆盖",
+                "光鸭云盘|2|8",
+                md=12,
+            ),
+            field(
+                "VTextField", "buffer_restore_grace_seconds", "扫描结束恢复延迟（秒）", "60"
+            ),
+            field("VTextField", "buffer_max_lease_minutes", "最大 Buffer 租约（分钟）", "15"),
+            field("VSwitch", "buffer_apply_before_scan", "扫描前应用 Buffer", md=4),
+            field("VSwitch", "buffer_restore_enabled", "扫描后恢复 Buffer", md=4),
+            field("VSwitch", "buffer_fail_open", "修改失败仍执行扫描", md=4),
+        )
+        advanced = rows(
+            field("VSwitch", "verify_tls", "验证 HTTPS 证书", md=4),
+            field("VSwitch", "notify_errors", "发送错误通知", md=4),
+            field("VTextField", "queue_capacity", "扫描队列上限", "10000"),
+            field("VTextField", "scans_per_second", "每秒最多提交目录数", "1"),
+        )
+
+        tabs = [
+            ("basic_tab", "基础", basic),
+            ("paths_tab", "路径与触发", paths),
+            ("ttd_tab", "TgToDrive", ttd),
+            ("buffer_tab", "Buffer", buffer),
+            ("advanced_tab", "高级", advanced),
+        ]
+        content: List[Dict[str, Any]] = [
+            {"component": "VRow", "content": [field("VSwitch", "enabled", "启用插件", md=12)]},
+            {
+                "component": "VTabs",
+                "props": {
+                    "model": "_tabs",
+                    "style": {"margin-top": "8px", "margin-bottom": "16px"},
+                    "stacked": True,
+                    "fixed-tabs": True,
+                },
+                "content": [
+                    {"component": "VTab", "props": {"value": value}, "text": title}
+                    for value, title, _ in tabs
+                ],
+            },
+            {
+                "component": "VWindow",
+                "props": {"model": "_tabs"},
+                "content": [
+                    {"component": "VWindowItem", "props": {"value": value}, "content": items}
+                    for value, _, items in tabs
+                ],
+            },
+        ]
         defaults = {
             "enabled": False,
             "cd2_url": "http://127.0.0.1:19798",
@@ -785,7 +988,11 @@ class CloudDrivePlexSync(_PluginBase):
             "ttd_max_pages": 5,
             "ttd_initial_mode": "baseline",
             "ttd_force_refresh": True,
+            "ttd_skip_paths": "",
+            "ttd_unmatched_policy": "skip",
             "notify_errors": True,
+            "queue_capacity": 10_000,
+            "scans_per_second": 1,
         }
         return [{"component": "VForm", "content": content}], defaults
 
@@ -802,6 +1009,7 @@ class CloudDrivePlexSync(_PluginBase):
                     "text": (
                         f"CD2推送：{'已连接' if status['push_connected'] else '未连接'}；"
                         f"TTD：{'已认证' if ttd.get('authenticated') else ('未启用' if not ttd.get('enabled') else '未连接')}；"
+                        f"TTD跳过：{int(ttd.get('skipped_records') or 0)}；"
                         f"待扫描：{status['pending_scans']}；Buffer模式：{status['buffer_mode']}"
                     ),
                 },

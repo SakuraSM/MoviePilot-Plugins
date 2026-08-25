@@ -10,6 +10,7 @@ import posixpath
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -36,6 +37,34 @@ class TTDProtocolError(TTDClientError):
 
 class TTDHistoryGapError(TTDClientError):
     """The saved cursor was not found within the configured page budget."""
+
+
+class TTDSubmitState(str, Enum):
+    """Whether one TTD directory was accepted, permanently skipped, or should retry."""
+
+    QUEUED = "queued"
+    SKIPPED = "skipped"
+    RETRY = "retry"
+
+
+@dataclass(frozen=True)
+class TTDSubmitResult:
+    """Typed submission outcome used to keep permanent skips out of the retry loop."""
+
+    state: TTDSubmitState
+    reason: str = ""
+
+    @classmethod
+    def queued(cls, reason: str = "") -> "TTDSubmitResult":
+        return cls(TTDSubmitState.QUEUED, reason)
+
+    @classmethod
+    def skipped(cls, reason: str) -> "TTDSubmitResult":
+        return cls(TTDSubmitState.SKIPPED, reason)
+
+    @classmethod
+    def retry(cls, reason: str) -> "TTDSubmitResult":
+        return cls(TTDSubmitState.RETRY, reason)
 
 
 @dataclass(frozen=True)
@@ -96,11 +125,32 @@ class TTDPollStatus:
     last_poll_at: float = 0
     last_success_at: float = 0
     last_record_at: float = 0
+    skipped_records: int = 0
+    last_skip: str = ""
     next_poll_at: float = 0
     last_error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def parse_ttd_skip_paths(value: object, target_root: str) -> List[str]:
+    """Parse absolute or target-root-relative directory prefixes to skip."""
+
+    root = normalize_path(target_root)
+    if not value:
+        return []
+    entries = value if isinstance(value, (list, tuple)) else str(value).splitlines()
+    paths: List[str] = []
+    for raw in entries:
+        item = str(raw).strip()
+        if not item or item.startswith("#"):
+            continue
+        path = normalize_path(item if item.startswith("/") else posixpath.join(root, item))
+        if not is_under(path, root):
+            raise PathMappingError(f"TTD 跳过路径越出目标根目录：{path}")
+        paths.append(path)
+    return sorted(set(paths), key=lambda item: (-len(item), item))
 
 
 _ID_FIELDS = (
@@ -382,6 +432,7 @@ class TTDHistoryPoller:
         cursor: Optional[TTDCursor] = None,
         persist_cursor: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
+        on_skip: Optional[Callable[[str], None]] = None,
         stats: Optional[PluginStats] = None,
         clock: Callable[[], float] = time.time,
         seen_limit: int = 1000,
@@ -404,6 +455,7 @@ class TTDHistoryPoller:
             self.cursor.scope = self.cursor_scope
         self.persist_cursor = persist_cursor
         self.on_error = on_error
+        self.on_skip = on_skip
         self.stats = stats
         self.clock = clock
         self.seen_limit = max(100, int(seen_limit))
@@ -412,6 +464,16 @@ class TTDHistoryPoller:
             seen_records=len(self.cursor.seen_keys),
         )
         self._wake_event = asyncio.Event()
+        self._last_processing_error = ""
+
+    @staticmethod
+    def _submission_result(value: Any) -> TTDSubmitResult:
+        if isinstance(value, TTDSubmitResult):
+            return value
+        # Preserve compatibility with callbacks written for the original bool contract.
+        return TTDSubmitResult.queued() if bool(value) else TTDSubmitResult.retry(
+            "目标目录暂未被扫描队列接受"
+        )
 
     def wake(self) -> None:
         self._wake_event.set()
@@ -488,30 +550,68 @@ class TTDHistoryPoller:
             return 0
 
         processed: List[str] = []
-        submitted_directories: Dict[str, bool] = {}
+        submitted_directories: Dict[str, TTDSubmitResult] = {}
         queued = 0
+        retrying = False
         # API is newest-first; enqueue oldest-first so Plex sees moves in order.
         for record in reversed(records):
             try:
                 cloud_directory = self._cloud_directory(record)
-                accepted = submitted_directories.get(cloud_directory)
-                is_new_directory = accepted is None
-                if accepted is None:
+                outcome = submitted_directories.get(cloud_directory)
+                is_new_directory = outcome is None
+                if outcome is None:
                     result = self.submit_directory(cloud_directory, "ttd")
                     if inspect.isawaitable(result):
                         result = await result
-                    accepted = bool(result)
-                    submitted_directories[cloud_directory] = accepted
-                if not accepted:
+                    outcome = self._submission_result(result)
+                    submitted_directories[cloud_directory] = outcome
+                if outcome.state == TTDSubmitState.RETRY:
+                    message = (
+                        f"TTD 整理记录暂未处理，将重试：{cloud_directory}"
+                        + (f"：{outcome.reason}" if outcome.reason else "")
+                    )
+                    self.status.last_error = message
+                    if message != self._last_processing_error and self.on_error:
+                        self.on_error(message)
+                    self._last_processing_error = message
+                    retrying = True
                     break
-                if is_new_directory:
+                if outcome.state == TTDSubmitState.SKIPPED:
+                    self.status.skipped_records += 1
+                    if self.stats:
+                        self.stats.ttd_skipped_records += 1
+                    if is_new_directory:
+                        message = (
+                            f"TTD 记录已跳过：{cloud_directory}"
+                            + (f"：{outcome.reason}" if outcome.reason else "")
+                        )
+                        self.status.last_skip = message
+                        if self.on_skip:
+                            self.on_skip(message)
+                if outcome.state == TTDSubmitState.QUEUED and is_new_directory:
                     queued += 1
                 processed.append(record.key)
                 self.status.last_record_at = self.clock()
+            except PathMappingError as exc:
+                message = f"TTD 记录已跳过：{record.target_path}：{exc}"
+                self.status.skipped_records += 1
+                self.status.last_skip = message
+                if self.stats:
+                    self.stats.ttd_skipped_records += 1
+                if self.on_skip:
+                    self.on_skip(message)
+                processed.append(record.key)
             except Exception as exc:
-                if self.on_error:
-                    self.on_error(f"TTD 整理记录处理失败：{exc}")
+                message = f"TTD 整理记录处理失败，将重试：{exc}"
+                self.status.last_error = message
+                if message != self._last_processing_error and self.on_error:
+                    self.on_error(message)
+                self._last_processing_error = message
+                retrying = True
                 break
+        if not retrying:
+            self._last_processing_error = ""
+            self.status.last_error = ""
         if processed or not self.cursor.initialized:
             self.cursor.initialized = True
             self._remember(reversed(processed))

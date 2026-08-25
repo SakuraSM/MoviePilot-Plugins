@@ -14,6 +14,8 @@ from clouddriveplexsync.ttd_client import (
     TTDHistoryRecord,
     TTDHistoryPage,
     TTDProtocolError,
+    TTDSubmitResult,
+    parse_ttd_skip_paths,
     parse_history_payload,
 )
 
@@ -267,6 +269,75 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(poller.cursor.seen_keys[:2], ["id:3", "id:2"])
 
+    async def test_permanently_skipped_record_advances_cursor_without_blocking_newer_records(self):
+        client = FakeHistoryClient(
+            {
+                1: [
+                    record("3", "电影/新片"),
+                    record("2", "待整理-通用/临时文件"),
+                    record("1", "电影/旧片"),
+                ]
+            }
+        )
+        submitted = []
+        skipped = []
+        errors = []
+
+        async def submit(path, source):
+            submitted.append((path, source))
+            if "/待整理-通用/" in path:
+                return TTDSubmitResult.skipped("命中 TTD 跳过路径")
+            return TTDSubmitResult.queued()
+
+        poller = TTDHistoryPoller(
+            client,
+            submit,
+            "/光鸭云盘/Media/Video/已整理",
+            cursor=TTDCursor(initialized=True, seen_keys=["id:1"]),
+            on_skip=skipped.append,
+            on_error=errors.append,
+        )
+
+        self.assertEqual(await poller.poll_once(), 1)
+        self.assertEqual(poller.cursor.seen_keys[:2], ["id:3", "id:2"])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("待整理-通用", skipped[0])
+        self.assertEqual(errors, [])
+
+        submitted.clear()
+        self.assertEqual(await poller.poll_once(), 0)
+        self.assertEqual(submitted, [])
+
+    async def test_retryable_rejection_is_reported_once_and_does_not_advance_cursor(self):
+        client = FakeHistoryClient(
+            {1: [record("2", "电影/新片"), record("1", "电影/旧片")]}
+        )
+        errors = []
+
+        poller = TTDHistoryPoller(
+            client,
+            lambda _path, _source: TTDSubmitResult.retry("Plex 暂时不可用"),
+            "/光鸭云盘/Media/Video/已整理",
+            cursor=TTDCursor(initialized=True, seen_keys=["id:1"]),
+            on_error=errors.append,
+        )
+
+        self.assertEqual(await poller.poll_once(), 0)
+        self.assertEqual(await poller.poll_once(), 0)
+        self.assertEqual(poller.cursor.seen_keys, ["id:1"])
+        self.assertEqual(len(errors), 1)
+
+    def test_skip_paths_support_relative_prefixes_and_path_boundaries(self):
+        root = "/光鸭云盘/Media/Video/已整理"
+        paths = parse_ttd_skip_paths("待整理-通用\n/光鸭云盘/Media/Video/已整理/_整理中", root)
+        self.assertEqual(
+            paths,
+            [
+                "/光鸭云盘/Media/Video/已整理/待整理-通用",
+                "/光鸭云盘/Media/Video/已整理/_整理中",
+            ],
+        )
+
     async def test_cursor_scope_change_establishes_a_new_baseline(self):
         client = FakeHistoryClient({1: [record("2", "电影/B")]})
         client.base_url = "https://ttd.example"
@@ -301,17 +372,18 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(poller.cursor.seen_keys, ["id:1"])
 
     async def test_target_traversal_is_rejected(self):
-        errors = []
+        skipped = []
         poller = TTDHistoryPoller(
             FakeHistoryClient({1: [record("2", "../Private")]}, page_size=20),
             lambda _path, _source: True,
             "/光鸭云盘/Media/Video/已整理",
             cursor=TTDCursor(initialized=True, seen_keys=[]),
             initial_mode="replay_latest",
-            on_error=errors.append,
+            on_skip=skipped.append,
         )
         self.assertEqual(await poller.poll_once(), 0)
-        self.assertIn("parent path segments", errors[0])
+        self.assertIn("parent path segments", skipped[0])
+        self.assertIn("id:2", poller.cursor.seen_keys)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
@@ -38,7 +39,11 @@ def install_moviepilot_stubs() -> None:
         def get_configs():
             return {}
 
-    logger = types.SimpleNamespace(error=lambda *_a, **_k: None, warning=lambda *_a, **_k: None)
+    logger = types.SimpleNamespace(
+        error=lambda *_a, **_k: None,
+        warning=lambda *_a, **_k: None,
+        info=lambda *_a, **_k: None,
+    )
     logger.exception = lambda *_a, **_k: None
     event_type = types.SimpleNamespace(TransferComplete="TransferComplete")
 
@@ -75,14 +80,32 @@ class PluginContractTests(unittest.TestCase):
         form, defaults = plugin.get_form()
         apis = plugin.get_api()
 
-        self.assertEqual(plugin.plugin_version, "1.1.0")
+        self.assertEqual(plugin.plugin_version, "1.2.0")
         self.assertEqual(len(apis), 7)
         self.assertTrue(all(item["auth"] == "bear" for item in apis))
         self.assertEqual(defaults["buffer_mode"], "adaptive")
         self.assertEqual(defaults["buffer_min_mb"], 1)
         self.assertFalse(defaults["enable_ttd"])
         self.assertEqual(defaults["ttd_initial_mode"], "baseline")
+        self.assertEqual(defaults["ttd_unmatched_policy"], "skip")
         self.assertEqual(form[0]["component"], "VForm")
+        components = []
+        models = []
+
+        def collect(items):
+            for item in items:
+                components.append(item.get("component"))
+                model = (item.get("props") or {}).get("model")
+                if model and model != "_tabs":
+                    models.append(model)
+                collect(item.get("content") or [])
+
+        collect(form)
+        self.assertIn("VTabs", components)
+        self.assertEqual(components.count("VTab"), 5)
+        self.assertEqual(components.count("VWindowItem"), 5)
+        self.assertEqual(len(models), len(set(models)))
+        self.assertEqual(set(models), set(defaults))
 
     def test_failed_cd2_queue_is_not_used_to_suppress_ttd(self) -> None:
         module = load_plugin_module()
@@ -102,6 +125,49 @@ class PluginContractTests(unittest.TestCase):
 
         self.assertFalse(plugin._submit_cd2_scan_directory(cloud_path))
         self.assertNotIn(cloud_path, plugin._recent_push_dirs)
+
+    def test_ttd_unmatched_plex_path_is_skipped_without_refreshing_cd2(self) -> None:
+        module = load_plugin_module()
+
+        class Mapper:
+            @staticmethod
+            def validate_cloud_path(path):
+                return path
+
+            @staticmethod
+            def cloud_to_plex(_path):
+                return "/data/CloudNas/Guangya/待整理-通用/片名"
+
+        class Worker:
+            mapper = Mapper()
+
+        class Plex:
+            @staticmethod
+            def find_target(path):
+                raise module.PathMappingError(f"no selected Plex library contains {path}")
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            async def force_list(self, path):
+                self.calls.append(path)
+
+        plugin = module.CloudDrivePlexSync()
+        plugin._worker = Worker()
+        plugin._plex = Plex()
+        plugin._client = Client()
+        plugin._ttd_unmatched_policy = "skip"
+
+        result = asyncio.run(
+            plugin._submit_ttd_directory(
+                "/光鸭云盘/Media/Video/已整理/待整理-通用/片名", "ttd"
+            )
+        )
+
+        self.assertEqual(result.state.value, "skipped")
+        self.assertIn("no selected Plex library", result.reason)
+        self.assertEqual(plugin._client.calls, [])
 
 
 if __name__ == "__main__":
