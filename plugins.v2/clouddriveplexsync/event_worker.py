@@ -124,6 +124,15 @@ class EventWorker:
     def load_queue(self, values: Iterable[dict]) -> None:
         self.coalescer.load(values)
 
+    def has_pending_cloud_directory(self, cloud_directory: str) -> bool:
+        """Return whether the exact directory is already waiting for a scan."""
+
+        try:
+            normalized = self.mapper.validate_cloud_path(cloud_directory)
+        except (PathMappingError, RuntimeError, ValueError):
+            return False
+        return any(item.cloud_path == normalized for item in self.coalescer.pending.values())
+
     def _record_error(self, message: str) -> None:
         self.last_error = message
         self.recent.append(f"ERROR {message}")
