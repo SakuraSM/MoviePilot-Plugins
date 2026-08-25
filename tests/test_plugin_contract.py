@@ -58,15 +58,19 @@ def install_moviepilot_stubs() -> None:
         sys.modules.setdefault(name, module)
 
 
+def load_plugin_module():
+    install_moviepilot_stubs()
+    path = _bootstrap.PLUGIN_DIR / "__init__.py"
+    spec = importlib.util.spec_from_file_location("clouddriveplexsync.entry", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class PluginContractTests(unittest.TestCase):
     def test_moviepilot_v2_contract(self) -> None:
-        install_moviepilot_stubs()
-        path = _bootstrap.PLUGIN_DIR / "__init__.py"
-        spec = importlib.util.spec_from_file_location("clouddriveplexsync.entry", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-
+        module = load_plugin_module()
         plugin = module.CloudDrivePlexSync()
         form, defaults = plugin.get_form()
         apis = plugin.get_api()
@@ -79,6 +83,25 @@ class PluginContractTests(unittest.TestCase):
         self.assertFalse(defaults["enable_ttd"])
         self.assertEqual(defaults["ttd_initial_mode"], "baseline")
         self.assertEqual(form[0]["component"], "VForm")
+
+    def test_failed_cd2_queue_is_not_used_to_suppress_ttd(self) -> None:
+        module = load_plugin_module()
+
+        class Worker:
+            @staticmethod
+            def submit_scan_directory(_path, _source):
+                return False
+
+            @staticmethod
+            def has_pending_cloud_directory(_path):
+                return False
+
+        plugin = module.CloudDrivePlexSync()
+        plugin._worker = Worker()
+        cloud_path = "/光鸭云盘/Media/Video/已整理/电影/片名"
+
+        self.assertFalse(plugin._submit_cd2_scan_directory(cloud_path))
+        self.assertNotIn(cloud_path, plugin._recent_push_dirs)
 
 
 if __name__ == "__main__":

@@ -365,13 +365,7 @@ class CloudDrivePlexSync(_PluginBase):
                         continue
                     try:
                         scan_dir = self._worker.mapper.cloud_scan_directory(path)
-                        ttd_at = self._recent_ttd_dirs.get(scan_dir, 0)
-                        if time.time() - ttd_at <= 120:
-                            if self._worker.has_pending_cloud_directory(scan_dir):
-                                self._worker.submit_scan_directory(scan_dir, "cd2")
-                            continue
-                        self._worker.submit_scan_directory(scan_dir, "cd2")
-                        self._recent_push_dirs[scan_dir] = time.time()
+                        self._submit_cd2_scan_directory(scan_dir)
                     except PathMappingError:
                         pass
                 cutoff = time.time() - 120
@@ -385,6 +379,21 @@ class CloudDrivePlexSync(_PluginBase):
                 await self._refresh_topology()
             elif event.kind == "status":
                 self._cd2_version = str((event.value or {}).get("version") or self._cd2_version)
+
+    def _submit_cd2_scan_directory(self, scan_dir: str) -> bool:
+        """Queue a CD2 event and remember it only after successful acceptance."""
+
+        if not self._worker:
+            return False
+        ttd_at = self._recent_ttd_dirs.get(scan_dir, 0)
+        if time.time() - ttd_at <= 120:
+            if self._worker.has_pending_cloud_directory(scan_dir):
+                return self._worker.submit_scan_directory(scan_dir, "cd2")
+            return True
+        queued = self._worker.submit_scan_directory(scan_dir, "cd2")
+        if queued:
+            self._recent_push_dirs[scan_dir] = time.time()
+        return queued
 
     async def _push_supervisor(self) -> None:
         backoff_steps = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
