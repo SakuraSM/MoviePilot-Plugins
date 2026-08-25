@@ -95,9 +95,11 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(form[0]["component"], "VForm")
         components = []
         models = []
+        nodes = []
 
         def collect(items):
             for item in items:
+                nodes.append(item)
                 components.append(item.get("component"))
                 model = (item.get("props") or {}).get("model")
                 if model and model != "_tabs":
@@ -108,8 +110,25 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("VTabs", components)
         self.assertEqual(components.count("VTab"), 5)
         self.assertEqual(components.count("VWindowItem"), 5)
+        self.assertIn("VContainer", components)
+        self.assertGreaterEqual(components.count("VCard"), 10)
         self.assertEqual(len(models), len(set(models)))
         self.assertEqual(set(models), set(defaults))
+
+        tabs = next(item for item in nodes if item.get("component") == "VTabs")
+        self.assertTrue(tabs["props"]["show-arrows"])
+        self.assertNotIn("fixed-tabs", tabs["props"])
+        self.assertNotIn("stacked", tabs["props"])
+
+        window = next(item for item in nodes if item.get("component") == "VWindow")
+        self.assertIn("overflow-visible", window["props"]["class"])
+
+        text_fields = [
+            item for item in nodes if item.get("component") == "VTextField"
+        ]
+        self.assertTrue(
+            all(item["props"].get("variant") == "outlined" for item in text_fields)
+        )
 
     def test_failed_cd2_queue_is_not_used_to_suppress_ttd(self) -> None:
         module = load_plugin_module()
