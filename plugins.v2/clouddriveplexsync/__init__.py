@@ -52,7 +52,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "CloudDrive Plex 增量同步"
     plugin_desc = "通过 CloudDrive2 推送或 TgToDrive 整理历史触发 Plex 局部扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"
@@ -67,6 +67,7 @@ class CloudDrivePlexSync(_PluginBase):
     _plex_sections: List[str] = []
     _watch_roots: List[str] = []
     _plex_overrides: List[Tuple[str, str]] = []
+    _cloud_plex_overrides: List[Tuple[str, str]] = []
     _moviepilot_overrides: List[Tuple[str, str]] = []
     _enable_push = True
     _enable_transfer_event = True
@@ -155,6 +156,9 @@ class CloudDrivePlexSync(_PluginBase):
             buffer_min_mb = max(1, int(config.get("buffer_min_mb") or 1))
             self._watch_roots = parse_roots(config.get("watch_roots"))
             self._plex_overrides = parse_override_lines(config.get("plex_path_overrides"))
+            self._cloud_plex_overrides = parse_override_lines(
+                config.get("cloud_plex_path_overrides")
+            )
             self._moviepilot_overrides = parse_override_lines(
                 config.get("moviepilot_path_overrides")
             )
@@ -347,6 +351,7 @@ class CloudDrivePlexSync(_PluginBase):
             watch_roots=self._watch_roots,
             mounts=self._mounts,
             plex_overrides=self._plex_overrides,
+            cloud_plex_overrides=self._cloud_plex_overrides,
             moviepilot_overrides=self._moviepilot_overrides,
         )
 
@@ -716,9 +721,24 @@ class CloudDrivePlexSync(_PluginBase):
             *,
             hint: Optional[str] = None,
             cols: int = 12,
-            md: int = 6,
+            md: int = 12,
+            lg: int = 6,
         ) -> Dict[str, Any]:
-            props: Dict[str, Any] = {"model": model, "label": label}
+            props: Dict[str, Any] = {
+                "model": model,
+                "label": label,
+                "density": "comfortable",
+                "hide-details": "auto",
+            }
+            if component in {"VTextField", "VTextarea", "VSelect"}:
+                props["variant"] = "outlined"
+            if component == "VTextarea":
+                props["auto-grow"] = True
+                props["rows"] = 2
+            if component == "VSwitch":
+                props["color"] = "primary"
+                props["inset"] = True
+                props["hide-details"] = True
             if placeholder:
                 props["placeholder"] = placeholder
             if hint:
@@ -781,72 +801,129 @@ class CloudDrivePlexSync(_PluginBase):
                 props["step"] = 0.1
             return {
                 "component": "VCol",
-                "props": {"cols": cols, "md": md},
+                "props": {
+                    "cols": cols,
+                    "md": md,
+                    "lg": lg,
+                    "class": "px-2 py-1",
+                },
                 "content": [{"component": component, "props": props}],
             }
 
-        def rows(*items: Dict[str, Any]) -> List[Dict[str, Any]]:
-            result: List[Dict[str, Any]] = []
-            current: List[Dict[str, Any]] = []
-            for item in items:
-                current.append(item)
-                if sum(int(value["props"].get("md", 12)) for value in current) >= 12:
-                    result.append({"component": "VRow", "content": current})
-                    current = []
-            if current:
-                result.append({"component": "VRow", "content": current})
-            return result
+        def grid(*items: Dict[str, Any]) -> List[Dict[str, Any]]:
+            return [
+                {
+                    "component": "VRow",
+                    "props": {"dense": True, "class": "ma-n1"},
+                    "content": list(items),
+                }
+            ]
 
-        basic = rows(
-            field("VTextField", "cd2_url", "CloudDrive2 地址", "http://NAS_IP:19798"),
-            field(
-                "VTextField",
-                "cd2_token",
-                "CloudDrive2 API Token",
-                hint="需要 Push Messages、Get Mounts、List Files、Get/Modify Cloud APIs 权限。",
+        def section(
+            title: str,
+            description: str,
+            *items: Dict[str, Any],
+        ) -> Dict[str, Any]:
+            return {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-4 rounded-lg"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "props": {"class": "text-subtitle-1 font-weight-medium pb-1"},
+                        "text": title,
+                    },
+                    {
+                        "component": "VCardSubtitle",
+                        "props": {"class": "text-wrap text-medium-emphasis pb-2"},
+                        "text": description,
+                    },
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pt-2 px-3 pb-3"},
+                        "content": grid(*items),
+                    },
+                ],
+            }
+
+        basic = [
+            section(
+                "CloudDrive2 连接",
+                "配置 CD2 服务地址和最小权限 API Token。",
+                field("VTextField", "cd2_url", "CloudDrive2 地址", "http://NAS_IP:19798"),
+                field(
+                    "VTextField",
+                    "cd2_token",
+                    "CloudDrive2 API Token",
+                    hint="需要 Push Messages、Get Mounts、List Files、Get/Modify Cloud APIs 权限。",
+                ),
             ),
-            field("VSelect", "plex_server", "Plex 服务"),
-            field(
-                "VTextField",
-                "plex_sections",
-                "允许的 Plex 媒体库 ID（逗号分隔）",
-                hint="只会扫描这些媒体库；路径不匹配时绝不退化为整库扫描。",
+            section(
+                "Plex 媒体库",
+                "插件只对选定媒体库提交精确目录扫描。",
+                field("VSelect", "plex_server", "Plex 服务"),
+                field(
+                    "VTextField",
+                    "plex_sections",
+                    "允许的 Plex 媒体库 ID（逗号分隔）",
+                    hint="路径不匹配时绝不退化为整库扫描。",
+                ),
             ),
-        )
+        ]
         paths = [
             {
                 "component": "VAlert",
                 "props": {
                     "type": "info",
                     "variant": "tonal",
+                    "class": "mb-4 rounded-lg",
                     "text": "监听根目录填写 CD2 云端路径；Plex 路径只填写在路径映射中。",
                 },
             },
-            *rows(
+            section(
+                "监听范围与直接映射",
+                "推荐直接把 CD2 云端路径映射到 Plex 容器内路径。",
                 field(
                     "VTextarea",
                     "watch_roots",
                     "CD2 监听根目录（每行一个）",
                     "/光鸭云盘/Media/Video/已整理",
-                    md=12,
+                    lg=12,
                 ),
                 field(
                     "VTextarea",
+                    "cloud_plex_path_overrides",
+                    "CD2 云端路径 → Plex 路径（推荐）",
+                    "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya",
+                    hint="优先使用，不依赖 CD2 挂载目录结构；按最长路径前缀匹配。",
+                    lg=12,
+                ),
+            ),
+            section(
+                "兼容路径映射",
+                "仅在直接映射未命中或需要处理 MoviePilot 本地路径时使用。",
+                field(
+                    "VTextarea",
                     "plex_path_overrides",
-                    "Plex 路径映射",
+                    "CD2 挂载路径 → Plex 路径（兼容）",
                     "/CloudNAS/Guangya => /data/CloudNas/Guangya",
-                    md=12,
+                    hint="仅在云端直连映射未命中时，通过 CD2 MountPoint 推导后使用。",
+                    lg=12,
                 ),
                 field(
                     "VTextarea",
                     "moviepilot_path_overrides",
                     "MoviePilot 路径映射（可选）",
-                    md=12,
+                    lg=12,
                 ),
-                field("VTextField", "debounce_seconds", "防抖秒数", "30", md=4),
-                field("VSwitch", "enable_push", "启用 CD2 推送", md=4),
+            ),
+            section(
+                "事件触发",
+                "控制事件来源和同目录变更的合并等待时间。",
+                field("VTextField", "debounce_seconds", "防抖秒数", "30", lg=4),
+                field("VSwitch", "enable_push", "启用 CD2 推送", lg=4),
                 field(
-                    "VSwitch", "enable_transfer_event", "启用 MoviePilot 入库事件", md=4
+                    "VSwitch", "enable_transfer_event", "启用 MoviePilot 入库事件", lg=4
                 ),
             ),
         ]
@@ -856,11 +933,14 @@ class CloudDrivePlexSync(_PluginBase):
                 "props": {
                     "type": "info",
                     "variant": "tonal",
+                    "class": "mb-4 rounded-lg",
                     "text": "目标根目录必须是 CD2 云端路径，例如 /光鸭云盘/Media/Video/已整理。",
                 },
             },
-            *rows(
-                field("VSwitch", "enable_ttd", "启用 TgToDrive 整理历史轮询", md=12),
+            section(
+                "连接与范围",
+                "通过整理历史增量获取完成记录，不递归轮询网盘目录。",
+                field("VSwitch", "enable_ttd", "启用 TgToDrive 整理历史轮询", lg=12),
                 field("VTextField", "ttd_url", "TgToDrive 地址", "https://ttd.example.com"),
                 field("VTextField", "ttd_cookie", "TgToDrive 登录 Cookie", "session=..."),
                 field("VTextField", "ttd_source", "TgToDrive 来源筛选", "光鸭云盘"),
@@ -870,13 +950,17 @@ class CloudDrivePlexSync(_PluginBase):
                     "TgToDrive 目标根目录（CD2 云端路径）",
                     "/光鸭云盘/Media/Video/已整理",
                 ),
+            ),
+            section(
+                "过滤与异常策略",
+                "跳过不应进入 Plex 的目录，并决定路径不匹配时是否阻塞游标。",
                 field(
                     "VTextarea",
                     "ttd_skip_paths",
                     "TgToDrive 跳过路径（每行一个）",
                     "待整理-通用\n_整理中",
                     hint="支持相对目标根目录或绝对 CD2 路径；命中后只记录一次并推进游标。",
-                    md=12,
+                    lg=12,
                 ),
                 field(
                     "VSelect",
@@ -885,46 +969,78 @@ class CloudDrivePlexSync(_PluginBase):
                     hint="推荐跳过，避免永久不匹配的记录阻塞后续入库。",
                 ),
                 field("VSelect", "ttd_initial_mode", "TgToDrive 首次运行"),
-                field("VTextField", "ttd_poll_seconds", "轮询间隔（秒）", "30", md=4),
-                field("VTextField", "ttd_page_size", "每页记录数", "20", md=4),
-                field("VTextField", "ttd_max_pages", "最大补页数", "5", md=4),
+            ),
+            section(
+                "轮询与刷新",
+                "设置请求频率、单次补页上限和扫描前的精确目录刷新。",
+                field("VTextField", "ttd_poll_seconds", "轮询间隔（秒）", "30", lg=4),
+                field("VTextField", "ttd_page_size", "每页记录数", "20", lg=4),
+                field("VTextField", "ttd_max_pages", "最大补页数", "5", lg=4),
                 field(
-                    "VSwitch", "ttd_force_refresh", "扫描前刷新准确的 CD2 目标目录", md=12
+                    "VSwitch", "ttd_force_refresh", "扫描前刷新准确的 CD2 目标目录", lg=12
                 ),
             ),
         ]
-        buffer = rows(
-            field("VSelect", "buffer_mode", "Buffer 联动模式", md=12),
-            field("VTextField", "buffer_min_mb", "Buffer 最小值（MB）", "1", md=4),
-            field("VTextField", "scan_buffer_mb", "空闲扫描 Buffer（MB）", "2", md=4),
-            field(
-                "VTextField",
-                "playback_scan_buffer_mb",
-                "播放期间扫描 Buffer（MB）",
-                "8",
-                md=4,
+        buffer = [
+            section(
+                "联动模式",
+                "可完全禁用，或在扫描期间临时调整后安全恢复。",
+                field("VSelect", "buffer_mode", "Buffer 联动模式", lg=12),
             ),
-            field(
-                "VTextarea",
-                "buffer_overrides",
-                "网盘级 Buffer 覆盖",
-                "光鸭云盘|2|8",
-                md=12,
+            section(
+                "扫描 Buffer",
+                "自适应模式会根据 Plex 播放状态选择空闲值或播放值。",
+                field("VTextField", "buffer_min_mb", "Buffer 最小值（MB）", "1", lg=4),
+                field("VTextField", "scan_buffer_mb", "空闲扫描 Buffer（MB）", "2", lg=4),
+                field(
+                    "VTextField",
+                    "playback_scan_buffer_mb",
+                    "播放期间扫描 Buffer（MB）",
+                    "8",
+                    lg=4,
+                ),
+                field(
+                    "VTextarea",
+                    "buffer_overrides",
+                    "网盘级 Buffer 覆盖",
+                    "光鸭云盘|2|8",
+                    lg=12,
+                ),
             ),
-            field(
-                "VTextField", "buffer_restore_grace_seconds", "扫描结束恢复延迟（秒）", "60"
+            section(
+                "租约与恢复",
+                "限制临时配置的持有时间，并控制修改失败时是否继续扫描。",
+                field(
+                    "VTextField",
+                    "buffer_restore_grace_seconds",
+                    "扫描结束恢复延迟（秒）",
+                    "60",
+                ),
+                field(
+                    "VTextField",
+                    "buffer_max_lease_minutes",
+                    "最大 Buffer 租约（分钟）",
+                    "15",
+                ),
+                field("VSwitch", "buffer_apply_before_scan", "扫描前应用 Buffer", lg=4),
+                field("VSwitch", "buffer_restore_enabled", "扫描后恢复 Buffer", lg=4),
+                field("VSwitch", "buffer_fail_open", "修改失败仍执行扫描", lg=4),
             ),
-            field("VTextField", "buffer_max_lease_minutes", "最大 Buffer 租约（分钟）", "15"),
-            field("VSwitch", "buffer_apply_before_scan", "扫描前应用 Buffer", md=4),
-            field("VSwitch", "buffer_restore_enabled", "扫描后恢复 Buffer", md=4),
-            field("VSwitch", "buffer_fail_open", "修改失败仍执行扫描", md=4),
-        )
-        advanced = rows(
-            field("VSwitch", "verify_tls", "验证 HTTPS 证书", md=4),
-            field("VSwitch", "notify_errors", "发送错误通知", md=4),
-            field("VTextField", "queue_capacity", "扫描队列上限", "10000"),
-            field("VTextField", "scans_per_second", "每秒最多提交目录数", "1"),
-        )
+        ]
+        advanced = [
+            section(
+                "安全与通知",
+                "生产环境建议保持证书验证，并开启错误通知。",
+                field("VSwitch", "verify_tls", "验证 HTTPS 证书"),
+                field("VSwitch", "notify_errors", "发送错误通知"),
+            ),
+            section(
+                "扫描调度",
+                "限制积压目录数量和 Plex 局部扫描的提交速率。",
+                field("VTextField", "queue_capacity", "扫描队列上限", "10000"),
+                field("VTextField", "scans_per_second", "每秒最多提交目录数", "1"),
+            ),
+        ]
 
         tabs = [
             ("basic_tab", "基础", basic),
@@ -934,14 +1050,26 @@ class CloudDrivePlexSync(_PluginBase):
             ("advanced_tab", "高级", advanced),
         ]
         content: List[Dict[str, Any]] = [
-            {"component": "VRow", "content": [field("VSwitch", "enabled", "启用插件", md=12)]},
+            {
+                "component": "VCard",
+                "props": {"variant": "tonal", "class": "mb-4 rounded-lg px-2"},
+                "content": [
+                    {
+                        "component": "VRow",
+                        "props": {"align": "center", "class": "ma-0"},
+                        "content": [field("VSwitch", "enabled", "启用插件", lg=12)],
+                    }
+                ],
+            },
             {
                 "component": "VTabs",
                 "props": {
                     "model": "_tabs",
-                    "style": {"margin-top": "8px", "margin-bottom": "16px"},
-                    "stacked": True,
-                    "fixed-tabs": True,
+                    "align-tabs": "start",
+                    "color": "primary",
+                    "density": "comfortable",
+                    "show-arrows": True,
+                    "class": "mb-4 rounded-lg border",
                 },
                 "content": [
                     {"component": "VTab", "props": {"value": value}, "text": title}
@@ -950,9 +1078,13 @@ class CloudDrivePlexSync(_PluginBase):
             },
             {
                 "component": "VWindow",
-                "props": {"model": "_tabs"},
+                "props": {"model": "_tabs", "class": "overflow-visible"},
                 "content": [
-                    {"component": "VWindowItem", "props": {"value": value}, "content": items}
+                    {
+                        "component": "VWindowItem",
+                        "props": {"value": value, "class": "px-1"},
+                        "content": items,
+                    }
                     for value, _, items in tabs
                 ],
             },
@@ -965,6 +1097,9 @@ class CloudDrivePlexSync(_PluginBase):
             "plex_server": "",
             "plex_sections": "",
             "watch_roots": "/光鸭云盘/Media/Video/已整理",
+            "cloud_plex_path_overrides": (
+                "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya"
+            ),
             "plex_path_overrides": "/CloudNAS/Guangya => /data/CloudNas/Guangya",
             "moviepilot_path_overrides": "",
             "debounce_seconds": 30,
@@ -996,7 +1131,18 @@ class CloudDrivePlexSync(_PluginBase):
             "queue_capacity": 10_000,
             "scans_per_second": 1,
         }
-        return [{"component": "VForm", "content": content}], defaults
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VContainer",
+                        "props": {"fluid": True, "class": "pa-0"},
+                        "content": content,
+                    }
+                ],
+            }
+        ], defaults
 
     def get_page(self) -> List[dict]:
         status = self._status_data()
