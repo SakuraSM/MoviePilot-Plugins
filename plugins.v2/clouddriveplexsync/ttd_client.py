@@ -56,6 +56,7 @@ class TTDHistoryPage:
 
     records: List[TTDHistoryRecord]
     item_count: int
+    has_next: Optional[bool] = None
 
 
 @dataclass
@@ -215,7 +216,7 @@ def _find_items(value: Any) -> Optional[List[Dict[str, Any]]]:
         candidate = value.get(name)
         if isinstance(candidate, list):
             return [item for item in candidate if isinstance(item, dict)]
-    for name in ("data", "result", "history"):
+    for name in ("data", "result", "history", "source_data"):
         candidate = _find_items(value.get(name))
         if candidate is not None:
             return candidate
@@ -340,6 +341,9 @@ class TTDClient:
                     if self.stats:
                         self.stats.ttd_auth_failures += 1
                     raise TTDAuthenticationError("TTD Cookie 已失效或无权读取整理历史")
+            source_data = payload.get("source_data") if isinstance(payload, dict) else None
+            if isinstance(source_data, dict) and source_data.get("error"):
+                raise TTDProtocolError(f"TTD 整理历史数据源错误：{source_data['error']}")
             raw_items = _find_items(payload)
             records = parse_history_payload(payload)
             item_count = len(raw_items or [])
@@ -347,7 +351,12 @@ class TTDClient:
                 raise TTDProtocolError(
                     f"TTD 返回 {item_count} 条成功记录，但只有 {len(records)} 条含可识别目标路径"
                 )
-            return TTDHistoryPage(records=records, item_count=item_count)
+            raw_has_next = payload.get("has_next") if isinstance(payload, dict) else None
+            return TTDHistoryPage(
+                records=records,
+                item_count=item_count,
+                has_next=raw_has_next if isinstance(raw_has_next, bool) else None,
+            )
         except TTDClientError:
             raise
         except Exception as exc:
@@ -454,7 +463,7 @@ class TTDHistoryPoller:
                     unseen_keys.add(record.key)
             if found_cursor:
                 break
-            if page_result.item_count < self.client.page_size:
+            if page_result.has_next is False or page_result.item_count < self.client.page_size:
                 exhausted = True
                 break
         if self.cursor.initialized and known and not found_cursor and not exhausted:

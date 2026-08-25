@@ -66,6 +66,41 @@ def record(record_id, target):
 
 
 class TTDParserTests(unittest.TestCase):
+    def test_real_ttd_source_data_shape_is_parsed(self):
+        records = parse_history_payload(
+            {
+                "available_sources": ["123云盘", "光鸭云盘"],
+                "generated_at": 1787634209,
+                "has_next": True,
+                "limit": 20,
+                "page": 1,
+                "source": "光鸭云盘",
+                "source_data": {
+                    "all_total": 269825,
+                    "error": None,
+                    "records": [
+                        {
+                            "created_at": "2026-08-25 04:04:44",
+                            "event_time": "2026-08-25 04:04:44",
+                            "file_id": "1939073661111193702",
+                            "file_name": "穹庐下的魔女.2026.S01E09.mkv",
+                            "id": 269364,
+                            "source": "光鸭云盘",
+                            "status": "success",
+                            "target_path": "动漫 / 日韩动漫 / 穹庐下的魔女 (2026) {tmdb-288971} / Season 1",
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].key, "id:269364")
+        self.assertEqual(records[0].completed_at, "2026-08-25 04:04:44")
+        self.assertEqual(
+            records[0].target_path,
+            "动漫/日韩动漫/穹庐下的魔女 (2026) {tmdb-288971}/Season 1",
+        )
+
     def test_nested_payload_and_relative_target_are_parsed(self):
         records = parse_history_payload(
             {
@@ -148,6 +183,39 @@ class TTDClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_nonempty_record_shape_is_rejected(self):
         transport = FakeHTTPClient(
             FakeResponse(payload={"success": True, "items": [{"id": 1, "status": "success"}]})
+        )
+        client = TTDClient("https://ttd.example", "session=secret", "光鸭云盘", client=transport)
+        with self.assertRaises(TTDProtocolError):
+            await client.fetch_page(1)
+
+    async def test_real_shape_exposes_server_pagination_flag(self):
+        transport = FakeHTTPClient(
+            FakeResponse(
+                payload={
+                    "has_next": False,
+                    "source_data": {
+                        "error": None,
+                        "records": [
+                            {
+                                "id": 269364,
+                                "status": "success",
+                                "source": "光鸭云盘",
+                                "created_at": "2026-08-25 04:04:44",
+                                "target_path": "动漫 / 日韩动漫 / 片名 / Season 1",
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        client = TTDClient("https://ttd.example", "session=secret", "光鸭云盘", client=transport)
+        page = await client.fetch_page(1)
+        self.assertFalse(page.has_next)
+        self.assertEqual(page.records[0].record_id, "269364")
+
+    async def test_source_data_error_is_rejected(self):
+        transport = FakeHTTPClient(
+            FakeResponse(payload={"source_data": {"error": "database busy", "records": []}})
         )
         client = TTDClient("https://ttd.example", "session=secret", "光鸭云盘", client=transport)
         with self.assertRaises(TTDProtocolError):
