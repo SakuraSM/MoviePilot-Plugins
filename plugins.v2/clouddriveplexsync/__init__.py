@@ -19,6 +19,7 @@ from app.schemas.types import EventType
 from .buffer_manager import BufferManager, BufferSettings, parse_buffer_overrides
 from .cd2_client import CloudDriveClient
 from .event_worker import EventWorker
+from .log_manager import LogMode, LogSettings, RepeatedLogLimiter
 from .models import FileSystemChange, MountPoint, PluginStats
 from .path_mapper import (
     PathMapper,
@@ -38,6 +39,110 @@ from .ttd_client import (
 )
 
 
+TTD_POLL_MIN_SECONDS = 10
+TTD_POLL_MAX_SECONDS = 3600
+DEBOUNCE_MAX_SECONDS = 3600
+LOG_DEDUP_MAX_SECONDS = 3600
+RECENT_LOG_MIN_ITEMS = 10
+RECENT_LOG_MAX_ITEMS = 200
+
+NUMERIC_FIELD_RULES: Dict[str, Dict[str, Any]] = {
+    "debounce_seconds": {
+        "min": 0,
+        "max": DEBOUNCE_MAX_SECONDS,
+        "step": 5,
+        "suffix": "秒",
+    },
+    "ttd_poll_seconds": {
+        "min": TTD_POLL_MIN_SECONDS,
+        "max": TTD_POLL_MAX_SECONDS,
+        "step": 10,
+        "suffix": "秒",
+    },
+    "ttd_page_size": {"min": 1, "max": 100, "step": 1, "suffix": "条"},
+    "ttd_max_pages": {"min": 1, "max": 20, "step": 1, "suffix": "页"},
+    "buffer_min_mb": {"min": 1, "step": 1, "suffix": "MB"},
+    "scan_buffer_mb": {"min": 1, "step": 1, "suffix": "MB"},
+    "playback_scan_buffer_mb": {"min": 1, "step": 1, "suffix": "MB"},
+    "buffer_restore_grace_seconds": {"min": 1, "step": 5, "suffix": "秒"},
+    "buffer_max_lease_minutes": {"min": 1, "step": 1, "suffix": "分钟"},
+    "queue_capacity": {"min": 1, "max": 100_000, "step": 100},
+    "scans_per_second": {
+        "min": 0.1,
+        "max": 10,
+        "step": 0.1,
+        "suffix": "目录/秒",
+        "inputmode": "decimal",
+    },
+    "log_dedup_seconds": {
+        "min": 0,
+        "max": LOG_DEDUP_MAX_SECONDS,
+        "step": 60,
+        "suffix": "秒",
+    },
+    "recent_log_limit": {
+        "min": RECENT_LOG_MIN_ITEMS,
+        "max": RECENT_LOG_MAX_ITEMS,
+        "step": 10,
+        "suffix": "条",
+    },
+}
+
+LOG_CATEGORY_MARKERS: Tuple[Tuple[str, str], ...] = (
+    ("TTD 目标目录刷新失败", "ttd_refresh_failed"),
+    ("TTD 整理记录暂未处理", "ttd_record_retry"),
+    ("TTD 整理记录处理失败", "ttd_record_failed"),
+    ("TTD 轮询失败", "ttd_poll_failed"),
+    ("TTD 轮询暂停推进", "ttd_poll_paused"),
+    ("TTD 记录已跳过", "ttd_record_skipped"),
+    ("CD2 推送断开", "cd2_push_disconnected"),
+    ("MoviePilot 入库事件处理失败", "moviepilot_transfer_failed"),
+    ("no selected Plex library contains", "plex_library_unmatched"),
+    ("scan queue reached", "scan_queue_full"),
+    ("buffer update failed", "buffer_update_failed"),
+)
+
+
+def _bounded_int(
+    value: object,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    label: str,
+) -> int:
+    """Parse one integer setting and report a user-facing validation error."""
+
+    raw_value = default if value in (None, "") else value
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}必须是整数") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间")
+    return parsed
+
+
+def _bounded_float(
+    value: object,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+    label: str,
+) -> float:
+    """Parse one decimal setting and report a user-facing validation error."""
+
+    raw_value = default if value in (None, "") else value
+    try:
+        parsed = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}必须是数字") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间")
+    return parsed
+
+
 class ResyncRequest(BaseModel):
     cloud_path: str
 
@@ -52,7 +157,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "CloudDrive Plex 增量同步"
     plugin_desc = "通过 CloudDrive2 推送或 TgToDrive 整理历史触发 Plex 局部扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"
@@ -87,6 +192,7 @@ class CloudDrivePlexSync(_PluginBase):
     _debounce_seconds = 30
     _queue_capacity = 10_000
     _scans_per_second = 1.0
+    _log_settings = LogSettings()
 
     def __init__(self) -> None:
         super().__init__()
@@ -115,6 +221,7 @@ class CloudDrivePlexSync(_PluginBase):
         self._recent_push_dirs: Dict[str, float] = {}
         self._recent_ttd_dirs: Dict[str, float] = {}
         self._buffer_settings = BufferSettings()
+        self._log_limiter = RepeatedLogLimiter(self._log_settings)
 
     def init_plugin(self, config: dict = None) -> None:
         self.stop_service()
@@ -139,20 +246,74 @@ class CloudDrivePlexSync(_PluginBase):
         self._ttd_url = str(config.get("ttd_url") or "").strip().rstrip("/")
         self._ttd_cookie = str(config.get("ttd_cookie") or "").strip()
         self._ttd_source = str(config.get("ttd_source") or "光鸭云盘").strip()
-        self._ttd_poll_seconds = max(10, int(config.get("ttd_poll_seconds") or 30))
-        self._ttd_page_size = max(1, min(100, int(config.get("ttd_page_size") or 20)))
-        self._ttd_max_pages = max(1, min(20, int(config.get("ttd_max_pages") or 5)))
         self._ttd_initial_mode = str(config.get("ttd_initial_mode") or "baseline").strip()
         self._ttd_force_refresh = bool(config.get("ttd_force_refresh", True))
         self._ttd_unmatched_policy = str(
             config.get("ttd_unmatched_policy") or "skip"
         ).strip().lower()
         self._notify_errors = bool(config.get("notify_errors", True))
-        self._debounce_seconds = max(0, int(config.get("debounce_seconds") or 30))
-        self._queue_capacity = max(1, int(config.get("queue_capacity") or 10_000))
-        self._scans_per_second = max(0.1, float(config.get("scans_per_second") or 1))
 
         try:
+            self._ttd_poll_seconds = _bounded_int(
+                config.get("ttd_poll_seconds"),
+                default=30,
+                minimum=TTD_POLL_MIN_SECONDS,
+                maximum=TTD_POLL_MAX_SECONDS,
+                label="TTD 轮询间隔",
+            )
+            self._ttd_page_size = _bounded_int(
+                config.get("ttd_page_size"),
+                default=20,
+                minimum=1,
+                maximum=100,
+                label="TTD 每页记录数",
+            )
+            self._ttd_max_pages = _bounded_int(
+                config.get("ttd_max_pages"),
+                default=5,
+                minimum=1,
+                maximum=20,
+                label="TTD 最大补页数",
+            )
+            self._debounce_seconds = _bounded_int(
+                config.get("debounce_seconds"),
+                default=30,
+                minimum=0,
+                maximum=DEBOUNCE_MAX_SECONDS,
+                label="事件合并等待时间",
+            )
+            self._queue_capacity = _bounded_int(
+                config.get("queue_capacity"),
+                default=10_000,
+                minimum=1,
+                maximum=100_000,
+                label="扫描队列上限",
+            )
+            self._scans_per_second = _bounded_float(
+                config.get("scans_per_second"),
+                default=1.0,
+                minimum=0.1,
+                maximum=10.0,
+                label="每秒最多提交目录数",
+            )
+            self._log_settings = LogSettings(
+                mode=str(config.get("log_mode") or LogMode.NORMAL.value),
+                dedup_seconds=_bounded_int(
+                    config.get("log_dedup_seconds"),
+                    default=300,
+                    minimum=0,
+                    maximum=LOG_DEDUP_MAX_SECONDS,
+                    label="重复日志合并窗口",
+                ),
+                recent_limit=_bounded_int(
+                    config.get("recent_log_limit"),
+                    default=50,
+                    minimum=RECENT_LOG_MIN_ITEMS,
+                    maximum=RECENT_LOG_MAX_ITEMS,
+                    label="最近处理记录上限",
+                ),
+            ).normalized()
+            self._log_limiter = RepeatedLogLimiter(self._log_settings)
             buffer_min_mb = max(1, int(config.get("buffer_min_mb") or 1))
             self._watch_roots = parse_roots(config.get("watch_roots"))
             self._plex_overrides = parse_override_lines(config.get("plex_path_overrides"))
@@ -294,6 +455,7 @@ class CloudDrivePlexSync(_PluginBase):
                 debounce_seconds=self._debounce_seconds,
                 capacity=self._queue_capacity,
                 scans_per_second=self._scans_per_second,
+                recent_limit=self._log_settings.recent_limit,
                 stats=self._stats,
                 persist_queue=self._persist_queue,
                 on_error=self._set_error,
@@ -541,21 +703,44 @@ class CloudDrivePlexSync(_PluginBase):
     def _persist_ttd_cursor(self, value: Dict[str, Any]) -> None:
         self.save_data("ttd_cursor", value)
 
+    @staticmethod
+    def _log_category(message: str) -> str:
+        text = str(message)
+        for marker, category in LOG_CATEGORY_MARKERS:
+            if marker in text:
+                return category
+        return text.split("：", 1)[0]
+
     def _set_error(self, message: str) -> None:
+        text = str(message)
         with self._status_lock:
-            self._last_error = str(message)
-        logger.warning(f"[CloudDrivePlexSync] {message}")
+            self._last_error = text
+        decision = self._log_limiter.record(
+            f"warning:{self._log_category(text)}", text
+        )
+        if not decision.should_emit:
+            return
+        logger.warning(f"[CloudDrivePlexSync] {decision.message}")
+        worker = self._worker
+        if worker:
+            worker.recent.append(f"ERROR {decision.message}")
         if self._notify_errors:
             try:
-                self.post_message(title="CloudDrive Plex 增量同步", text=str(message))
+                self.post_message(title="CloudDrive Plex 增量同步", text=decision.message)
             except Exception:
                 pass
 
     def _record_info(self, message: str) -> None:
-        logger.info(f"[CloudDrivePlexSync] {message}")
+        if not self._log_limiter.should_emit_routine():
+            return
+        text = str(message)
+        decision = self._log_limiter.record(f"info:{self._log_category(text)}", text)
+        if not decision.should_emit:
+            return
+        logger.info(f"[CloudDrivePlexSync] {decision.message}")
         worker = self._worker
         if worker:
-            worker.recent.append(f"SKIP {message}")
+            worker.recent.append(f"SKIP {decision.message}")
 
     def _submit(self, coroutine: Any, timeout: float = 30.0) -> Any:
         if not self._loop or not self._loop.is_running():
@@ -597,6 +782,7 @@ class CloudDrivePlexSync(_PluginBase):
             "cloud_apis": cloud_status,
             "mounts": [item.__dict__ for item in self._mounts],
             "recent": list(worker.recent) if worker else [],
+            "log": self._log_limiter.snapshot(),
             "stats": self._stats.to_dict(),
             "plex": self._plex.describe() if self._plex else {},
             "ttd": self._ttd_poller.status.to_dict()
@@ -764,6 +950,12 @@ class CloudDrivePlexSync(_PluginBase):
                     {"title": "跳过并推进游标（推荐）", "value": "skip"},
                     {"title": "保留记录并持续重试", "value": "retry"},
                 ]
+            if model == "log_mode":
+                props["items"] = [
+                    {"title": "精简：只保留告警", "value": "quiet"},
+                    {"title": "标准：告警和跳过摘要（推荐）", "value": "normal"},
+                    {"title": "详细：输出每条记录", "value": "verbose"},
+                ]
             if model.startswith("ttd_") and model != "enable_ttd":
                 props["show"] = "{{ enable_ttd }}"
             if model in {
@@ -779,26 +971,11 @@ class CloudDrivePlexSync(_PluginBase):
                 props["show"] = "{{ buffer_mode !== 'disabled' }}"
             if model == "playback_scan_buffer_mb":
                 props["show"] = "{{ buffer_mode === 'adaptive' }}"
-            if model in {
-                "debounce_seconds",
-                "buffer_min_mb",
-                "scan_buffer_mb",
-                "playback_scan_buffer_mb",
-                "buffer_restore_grace_seconds",
-                "buffer_max_lease_minutes",
-                "ttd_poll_seconds",
-                "ttd_page_size",
-                "ttd_max_pages",
-                "queue_capacity",
-                "scans_per_second",
-            }:
+            numeric_rules = NUMERIC_FIELD_RULES.get(model)
+            if numeric_rules:
                 props["type"] = "number"
-                props["min"] = 1
-            if model == "ttd_poll_seconds":
-                props["min"] = 10
-            if model == "scans_per_second":
-                props["min"] = 0.1
-                props["step"] = 0.1
+                props["inputmode"] = "numeric"
+                props.update(numeric_rules)
             return {
                 "component": "VCol",
                 "props": {
@@ -919,8 +1096,21 @@ class CloudDrivePlexSync(_PluginBase):
             ),
             section(
                 "事件触发",
-                "控制事件来源和同目录变更的合并等待时间。",
-                field("VTextField", "debounce_seconds", "防抖秒数", "30", lg=4),
+                (
+                    "控制事件来源和同目录变更的合并等待时间。"
+                    "等待越长，批量整理合并越充分。"
+                ),
+                field(
+                    "VTextField",
+                    "debounce_seconds",
+                    "事件合并等待",
+                    "30",
+                    hint=(
+                        "可设为 0 到 3600 秒。TTD 使用默认 30 秒轮询时，"
+                        "再等待 30 秒后提交扫描。"
+                    ),
+                    lg=4,
+                ),
                 field("VSwitch", "enable_push", "启用 CD2 推送", lg=4),
                 field(
                     "VSwitch", "enable_transfer_event", "启用 MoviePilot 入库事件", lg=4
@@ -934,7 +1124,10 @@ class CloudDrivePlexSync(_PluginBase):
                     "type": "info",
                     "variant": "tonal",
                     "class": "mb-4 rounded-lg",
-                    "text": "目标根目录必须是 CD2 云端路径，例如 /光鸭云盘/Media/Video/已整理。",
+                    "text": (
+                        "轮询间隔可以修改。它决定发现新记录的速度；"
+                        "事件合并等待决定发现后多久提交 Plex。"
+                    ),
                 },
             },
             section(
@@ -972,10 +1165,34 @@ class CloudDrivePlexSync(_PluginBase):
             ),
             section(
                 "轮询与刷新",
-                "设置请求频率、单次补页上限和扫描前的精确目录刷新。",
-                field("VTextField", "ttd_poll_seconds", "轮询间隔（秒）", "30", lg=4),
-                field("VTextField", "ttd_page_size", "每页记录数", "20", lg=4),
-                field("VTextField", "ttd_max_pages", "最大补页数", "5", lg=4),
+                "设置发现速度、单次补页上限和扫描前的精确目录刷新。",
+                field(
+                    "VTextField",
+                    "ttd_poll_seconds",
+                    "整理历史轮询间隔",
+                    "30",
+                    hint=(
+                        "范围 10～3600 秒。10 秒约 360 次/小时，"
+                        "30 秒约 120 次/小时，60 秒约 60 次/小时。"
+                    ),
+                    lg=4,
+                ),
+                field(
+                    "VTextField",
+                    "ttd_page_size",
+                    "每页记录数",
+                    "20",
+                    hint="正常情况下只读取第一页；出现较多新记录时才继续补页。",
+                    lg=4,
+                ),
+                field(
+                    "VTextField",
+                    "ttd_max_pages",
+                    "单次最大补页数",
+                    "5",
+                    hint="用于限制一次轮询的最大请求量，超过后暂停推进游标并告警。",
+                    lg=4,
+                ),
                 field(
                     "VSwitch", "ttd_force_refresh", "扫描前刷新准确的 CD2 目标目录", lg=12
                 ),
@@ -990,12 +1207,12 @@ class CloudDrivePlexSync(_PluginBase):
             section(
                 "扫描 Buffer",
                 "自适应模式会根据 Plex 播放状态选择空闲值或播放值。",
-                field("VTextField", "buffer_min_mb", "Buffer 最小值（MB）", "1", lg=4),
-                field("VTextField", "scan_buffer_mb", "空闲扫描 Buffer（MB）", "2", lg=4),
+                field("VTextField", "buffer_min_mb", "Buffer 最小值", "1", lg=4),
+                field("VTextField", "scan_buffer_mb", "空闲扫描 Buffer", "2", lg=4),
                 field(
                     "VTextField",
                     "playback_scan_buffer_mb",
-                    "播放期间扫描 Buffer（MB）",
+                    "播放期间扫描 Buffer",
                     "8",
                     lg=4,
                 ),
@@ -1013,13 +1230,13 @@ class CloudDrivePlexSync(_PluginBase):
                 field(
                     "VTextField",
                     "buffer_restore_grace_seconds",
-                    "扫描结束恢复延迟（秒）",
+                    "扫描结束恢复延迟",
                     "60",
                 ),
                 field(
                     "VTextField",
                     "buffer_max_lease_minutes",
-                    "最大 Buffer 租约（分钟）",
+                    "最大 Buffer 租约",
                     "15",
                 ),
                 field("VSwitch", "buffer_apply_before_scan", "扫描前应用 Buffer", lg=4),
@@ -1029,10 +1246,40 @@ class CloudDrivePlexSync(_PluginBase):
         ]
         advanced = [
             section(
-                "安全与通知",
-                "生产环境建议保持证书验证，并开启错误通知。",
+                "运行安全",
+                (
+                    "生产环境建议保持证书验证。"
+                    "错误通知会跟随重复日志合并窗口限频。"
+                ),
                 field("VSwitch", "verify_tls", "验证 HTTPS 证书"),
                 field("VSwitch", "notify_errors", "发送错误通知"),
+            ),
+            section(
+                "日志控制",
+                (
+                    "大量同类告警会在时间窗口内合并；"
+                    "状态页仍显示累计合并数量和最近错误。"
+                ),
+                field("VSelect", "log_mode", "日志详细程度", lg=4),
+                field(
+                    "VTextField",
+                    "log_dedup_seconds",
+                    "重复日志合并窗口",
+                    "300",
+                    hint=(
+                        "相同类别只立即输出第一条，窗口结束后带上已合并数量；"
+                        "设为 0 表示关闭合并。"
+                    ),
+                    lg=4,
+                ),
+                field(
+                    "VTextField",
+                    "recent_log_limit",
+                    "状态页最近记录上限",
+                    "50",
+                    hint="只影响状态页展示，不影响扫描队列、游标和错误计数。",
+                    lg=4,
+                ),
             ),
             section(
                 "扫描调度",
@@ -1128,6 +1375,9 @@ class CloudDrivePlexSync(_PluginBase):
             "ttd_skip_paths": "",
             "ttd_unmatched_policy": "skip",
             "notify_errors": True,
+            "log_mode": "normal",
+            "log_dedup_seconds": 300,
+            "recent_log_limit": 50,
             "queue_capacity": 10_000,
             "scans_per_second": 1,
         }
@@ -1147,6 +1397,7 @@ class CloudDrivePlexSync(_PluginBase):
     def get_page(self) -> List[dict]:
         status = self._status_data()
         ttd = status.get("ttd") or {}
+        log_status = status.get("log") or {}
         healthy = bool(status["push_connected"] or ttd.get("authenticated"))
         return [
             {
@@ -1158,6 +1409,7 @@ class CloudDrivePlexSync(_PluginBase):
                         f"CD2推送：{'已连接' if status['push_connected'] else '未连接'}；"
                         f"TTD：{'已认证' if ttd.get('authenticated') else ('未启用' if not ttd.get('enabled') else '未连接')}；"
                         f"TTD跳过：{int(ttd.get('skipped_records') or 0)}；"
+                        f"日志合并：{int(log_status.get('suppressed_total') or 0)}；"
                         f"待扫描：{status['pending_scans']}；Buffer模式：{status['buffer_mode']}"
                     ),
                 },

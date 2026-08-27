@@ -91,6 +91,7 @@ class EventWorker:
         debounce_seconds: int = 30,
         capacity: int = 10_000,
         scans_per_second: float = 1.0,
+        recent_limit: int = 50,
         stats: Optional[PluginStats] = None,
         persist_queue: Optional[Callable[[List[dict]], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
@@ -107,7 +108,7 @@ class EventWorker:
         self.on_error = on_error
         self.clock = clock
         self.flush_signal = asyncio.Event()
-        self.recent: Deque[str] = deque(maxlen=100)
+        self.recent: Deque[str] = deque(maxlen=max(10, min(200, int(recent_limit))))
         self.last_scan_at: float = 0
         self.last_error: str = ""
 
@@ -135,9 +136,10 @@ class EventWorker:
 
     def _record_error(self, message: str) -> None:
         self.last_error = message
-        self.recent.append(f"ERROR {message}")
         if self.on_error:
             self.on_error(message)
+        else:
+            self.recent.append(f"ERROR {message}")
 
     def submit_cloud_path(self, cloud_path: str, source: str = "cd2") -> bool:
         try:

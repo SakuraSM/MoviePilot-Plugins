@@ -80,7 +80,7 @@ class PluginContractTests(unittest.TestCase):
         form, defaults = plugin.get_form()
         apis = plugin.get_api()
 
-        self.assertEqual(plugin.plugin_version, "1.3.0")
+        self.assertEqual(plugin.plugin_version, "1.4.0")
         self.assertEqual(len(apis), 7)
         self.assertTrue(all(item["auth"] == "bear" for item in apis))
         self.assertEqual(defaults["buffer_mode"], "adaptive")
@@ -88,6 +88,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertFalse(defaults["enable_ttd"])
         self.assertEqual(defaults["ttd_initial_mode"], "baseline")
         self.assertEqual(defaults["ttd_unmatched_policy"], "skip")
+        self.assertEqual(defaults["ttd_poll_seconds"], 30)
+        self.assertEqual(defaults["log_mode"], "normal")
+        self.assertEqual(defaults["log_dedup_seconds"], 300)
+        self.assertEqual(defaults["recent_log_limit"], 50)
         self.assertEqual(
             defaults["cloud_plex_path_overrides"],
             "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya",
@@ -129,6 +133,16 @@ class PluginContractTests(unittest.TestCase):
         self.assertTrue(
             all(item["props"].get("variant") == "outlined" for item in text_fields)
         )
+        fields_by_model = {
+            item["props"].get("model"): item["props"]
+            for item in text_fields
+            if item["props"].get("model")
+        }
+        self.assertEqual(fields_by_model["ttd_poll_seconds"]["min"], 10)
+        self.assertEqual(fields_by_model["ttd_poll_seconds"]["max"], 3600)
+        self.assertEqual(fields_by_model["ttd_poll_seconds"]["suffix"], "秒")
+        self.assertEqual(fields_by_model["debounce_seconds"]["min"], 0)
+        self.assertEqual(fields_by_model["recent_log_limit"]["max"], 200)
 
     def test_failed_cd2_queue_is_not_used_to_suppress_ttd(self) -> None:
         module = load_plugin_module()
@@ -148,6 +162,35 @@ class PluginContractTests(unittest.TestCase):
 
         self.assertFalse(plugin._submit_cd2_scan_directory(cloud_path))
         self.assertNotIn(cloud_path, plugin._recent_push_dirs)
+
+    def test_repeated_refresh_warnings_are_aggregated_by_category(self) -> None:
+        module = load_plugin_module()
+        warnings = []
+        notifications = []
+        module.logger = types.SimpleNamespace(
+            warning=warnings.append,
+            info=lambda *_args, **_kwargs: None,
+            error=lambda *_args, **_kwargs: None,
+            exception=lambda *_args, **_kwargs: None,
+        )
+        plugin = module.CloudDrivePlexSync()
+        plugin.post_message = lambda **kwargs: notifications.append(kwargs)
+
+        plugin._set_error("TTD 目标目录刷新失败，仍提交局部扫描：/电影/A")
+        plugin._set_error("TTD 目标目录刷新失败，仍提交局部扫描：/电影/B")
+
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(plugin._log_limiter.snapshot()["suppressed_total"], 1)
+
+    def test_ttd_poll_interval_rejects_values_below_ten_seconds(self) -> None:
+        module = load_plugin_module()
+        plugin = module.CloudDrivePlexSync()
+
+        plugin.init_plugin({"enabled": False, "ttd_poll_seconds": 5})
+
+        self.assertFalse(plugin.get_state())
+        self.assertIn("TTD 轮询间隔必须在 10 到 3600 之间", plugin._last_error)
 
     def test_ttd_unmatched_plex_path_is_skipped_without_refreshing_cd2(self) -> None:
         module = load_plugin_module()
