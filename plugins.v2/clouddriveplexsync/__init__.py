@@ -52,7 +52,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "CloudDrive Plex 增量同步"
     plugin_desc = "通过 CloudDrive2 推送或 TgToDrive 整理历史触发 Plex 局部扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"
@@ -60,6 +60,7 @@ class CloudDrivePlexSync(_PluginBase):
     auth_level = 1
 
     _enabled = False
+    _enable_cd2 = True
     _cd2_url = ""
     _cd2_token = ""
     _verify_tls = True
@@ -125,6 +126,7 @@ class CloudDrivePlexSync(_PluginBase):
             return
         config = config or {}
         self._enabled = bool(config.get("enabled"))
+        self._enable_cd2 = bool(config.get("enable_cd2", True))
         self._cd2_url = str(config.get("cd2_url") or "").strip().rstrip("/")
         self._cd2_token = str(config.get("cd2_token") or "").strip()
         self._verify_tls = bool(config.get("verify_tls", True))
@@ -133,8 +135,10 @@ class CloudDrivePlexSync(_PluginBase):
         if isinstance(sections, str):
             sections = [item.strip() for item in sections.replace("\n", ",").split(",")]
         self._plex_sections = [str(item) for item in sections if str(item).strip()]
-        self._enable_push = bool(config.get("enable_push", True))
-        self._enable_transfer_event = bool(config.get("enable_transfer_event", True))
+        self._enable_push = self._enable_cd2 and bool(config.get("enable_push", True))
+        self._enable_transfer_event = self._enable_cd2 and bool(
+            config.get("enable_transfer_event", True)
+        )
         self._enable_ttd = bool(config.get("enable_ttd", False))
         self._ttd_url = str(config.get("ttd_url") or "").strip().rstrip("/")
         self._ttd_cookie = str(config.get("ttd_cookie") or "").strip()
@@ -143,7 +147,9 @@ class CloudDrivePlexSync(_PluginBase):
         self._ttd_page_size = max(1, min(100, int(config.get("ttd_page_size") or 20)))
         self._ttd_max_pages = max(1, min(20, int(config.get("ttd_max_pages") or 5)))
         self._ttd_initial_mode = str(config.get("ttd_initial_mode") or "baseline").strip()
-        self._ttd_force_refresh = bool(config.get("ttd_force_refresh", True))
+        self._ttd_force_refresh = self._enable_cd2 and bool(
+            config.get("ttd_force_refresh", True)
+        )
         self._ttd_unmatched_policy = str(
             config.get("ttd_unmatched_policy") or "skip"
         ).strip().lower()
@@ -153,14 +159,19 @@ class CloudDrivePlexSync(_PluginBase):
         self._scans_per_second = max(0.1, float(config.get("scans_per_second") or 1))
 
         try:
-            buffer_min_mb = max(1, int(config.get("buffer_min_mb") or 1))
             self._watch_roots = parse_roots(config.get("watch_roots"))
-            self._plex_overrides = parse_override_lines(config.get("plex_path_overrides"))
+            self._plex_overrides = (
+                parse_override_lines(config.get("plex_path_overrides"))
+                if self._enable_cd2
+                else []
+            )
             self._cloud_plex_overrides = parse_override_lines(
                 config.get("cloud_plex_path_overrides")
             )
-            self._moviepilot_overrides = parse_override_lines(
-                config.get("moviepilot_path_overrides")
+            self._moviepilot_overrides = (
+                parse_override_lines(config.get("moviepilot_path_overrides"))
+                if self._enable_cd2
+                else []
             )
             configured_ttd_root = str(config.get("ttd_target_root") or "").strip()
             self._ttd_target_root = normalize_path(
@@ -172,7 +183,7 @@ class CloudDrivePlexSync(_PluginBase):
             if self._watch_roots and not any(
                 is_under(self._ttd_target_root, root) for root in self._watch_roots
             ):
-                raise PathMappingError("TTD 目标根目录必须位于某个 CD2 监听根目录内")
+                raise PathMappingError("TTD 目标根目录必须位于某个监听根目录内")
             if self._ttd_initial_mode not in {"baseline", "replay_latest"}:
                 raise ValueError("TTD 首次运行模式只能是 baseline 或 replay_latest")
             if self._ttd_unmatched_policy not in {"skip", "retry"}:
@@ -183,20 +194,26 @@ class CloudDrivePlexSync(_PluginBase):
                     raise ValueError("TTD 地址必须是完整的 http:// 或 https:// URL")
             if "\r" in self._ttd_cookie or "\n" in self._ttd_cookie:
                 raise ValueError("TTD Cookie 不能包含换行")
-            self._buffer_settings = BufferSettings(
-                mode=str(config.get("buffer_mode") or "adaptive"),
-                min_mb=buffer_min_mb,
-                scan_mb=int(config.get("scan_buffer_mb") or 2),
-                playback_mb=int(config.get("playback_scan_buffer_mb") or 8),
-                apply_before_scan=bool(config.get("buffer_apply_before_scan", True)),
-                restore_enabled=bool(config.get("buffer_restore_enabled", True)),
-                restore_grace_seconds=int(config.get("buffer_restore_grace_seconds") or 60),
-                max_lease_minutes=int(config.get("buffer_max_lease_minutes") or 15),
-                fail_open=bool(config.get("buffer_fail_open", True)),
-                overrides=parse_buffer_overrides(
-                    config.get("buffer_overrides"), min_mb=buffer_min_mb
-                ),
-            )
+            if self._enable_cd2:
+                buffer_min_mb = max(1, int(config.get("buffer_min_mb") or 1))
+                self._buffer_settings = BufferSettings(
+                    mode=str(config.get("buffer_mode") or "adaptive"),
+                    min_mb=buffer_min_mb,
+                    scan_mb=int(config.get("scan_buffer_mb") or 2),
+                    playback_mb=int(config.get("playback_scan_buffer_mb") or 8),
+                    apply_before_scan=bool(config.get("buffer_apply_before_scan", True)),
+                    restore_enabled=bool(config.get("buffer_restore_enabled", True)),
+                    restore_grace_seconds=int(
+                        config.get("buffer_restore_grace_seconds") or 60
+                    ),
+                    max_lease_minutes=int(config.get("buffer_max_lease_minutes") or 15),
+                    fail_open=bool(config.get("buffer_fail_open", True)),
+                    overrides=parse_buffer_overrides(
+                        config.get("buffer_overrides"), min_mb=buffer_min_mb
+                    ),
+                )
+            else:
+                self._buffer_settings = BufferSettings(mode="disabled")
         except (TypeError, ValueError, PathMappingError) as exc:
             self._enabled = False
             self._last_error = f"配置无效：{exc}"
@@ -206,9 +223,9 @@ class CloudDrivePlexSync(_PluginBase):
         if not self._enabled:
             return
         missing = []
-        if not self._cd2_url:
+        if self._enable_cd2 and not self._cd2_url:
             missing.append("CD2 地址")
-        if not self._cd2_token:
+        if self._enable_cd2 and not self._cd2_token:
             missing.append("CD2 API Token")
         if not self._plex_server:
             missing.append("Plex 服务")
@@ -220,6 +237,13 @@ class CloudDrivePlexSync(_PluginBase):
             missing.append("TTD Cookie")
         if self._enable_ttd and not self._ttd_source:
             missing.append("TTD 来源筛选")
+        if not self._enable_cd2 and not self._enable_ttd:
+            missing.append("TTD 整理历史轮询")
+        if not self._enable_cd2 and not any(
+            is_under(self._ttd_target_root, source)
+            for source, _ in self._cloud_plex_overrides
+        ):
+            missing.append("覆盖 TTD 目标根目录的云端路径 → Plex 路径直接映射")
         if missing:
             self._enabled = False
             self._last_error = "缺少配置：" + "、".join(missing)
@@ -267,25 +291,35 @@ class CloudDrivePlexSync(_PluginBase):
         self._started_at = time.time()
         self._stats = PluginStats()
         self._plex = self._resolve_plex()
-        self._client = CloudDriveClient(
-            self._cd2_url,
-            self._cd2_token,
-            verify=self._verify_tls,
-            stats=self._stats,
-        )
         try:
-            await self._refresh_topology()
+            if self._enable_cd2:
+                self._client = CloudDriveClient(
+                    self._cd2_url,
+                    self._cd2_token,
+                    verify=self._verify_tls,
+                    stats=self._stats,
+                )
+                await self._refresh_topology()
+            else:
+                self._client = None
+                self._mounts = []
+                self._cloud_apis = []
+                self._cd2_authenticated = False
+                self._cd2_version = ""
             mapper = self._build_mapper()
-            self._buffer = BufferManager(
-                self._client,
-                self._buffer_settings,
-                playback_probe=self._plex.is_playing_under,
-                scan_probe=self._plex.is_scanning,
-                persist=self._persist_leases,
-                stats=self._stats,
-            )
-            self._buffer.load_leases(self.get_data("buffer_leases") or [])
-            await self._buffer.recover_stale()
+            if self._client:
+                self._buffer = BufferManager(
+                    self._client,
+                    self._buffer_settings,
+                    playback_probe=self._plex.is_playing_under,
+                    scan_probe=self._plex.is_scanning,
+                    persist=self._persist_leases,
+                    stats=self._stats,
+                )
+                self._buffer.load_leases(self.get_data("buffer_leases") or [])
+                await self._buffer.recover_stale()
+            else:
+                self._buffer = None
             self._worker = EventWorker(
                 mapper,
                 self._plex,
@@ -324,9 +358,10 @@ class CloudDrivePlexSync(_PluginBase):
             self._ready.set()
 
             tasks = [
-                asyncio.create_task(self._worker.run(self._stop_event), name="cd2plex-events"),
-                asyncio.create_task(self._lease_loop(), name="cd2plex-leases"),
+                asyncio.create_task(self._worker.run(self._stop_event), name="cd2plex-events")
             ]
+            if self._buffer:
+                tasks.append(asyncio.create_task(self._lease_loop(), name="cd2plex-leases"))
             if self._enable_push:
                 tasks.append(asyncio.create_task(self._push_supervisor(), name="cd2plex-push"))
             if self._ttd_poller:
@@ -480,9 +515,9 @@ class CloudDrivePlexSync(_PluginBase):
     async def _submit_ttd_directory(
         self, cloud_directory: str, source: str
     ) -> TTDSubmitResult:
-        """Refresh one exact CD2 directory, then enqueue its Plex path."""
+        """Validate one TTD directory, optionally refresh it, then enqueue its Plex path."""
 
-        if not self._worker or not self._client or not self._plex:
+        if not self._worker or not self._plex:
             return TTDSubmitResult.retry("插件后台组件尚未就绪")
         try:
             path = self._worker.mapper.validate_cloud_path(cloud_directory)
@@ -509,6 +544,8 @@ class CloudDrivePlexSync(_PluginBase):
                 return TTDSubmitResult.retry("扫描队列暂未接受目标目录")
             return TTDSubmitResult.queued("近期 CD2 推送已覆盖该目录")
         if self._ttd_force_refresh:
+            if not self._client:
+                return TTDSubmitResult.retry("CD2 未启用，无法刷新目标目录")
             try:
                 await self._client.force_list(path)
             except Exception as exc:
@@ -581,6 +618,7 @@ class CloudDrivePlexSync(_PluginBase):
         return {
             "enabled": self._enabled,
             "ready": self._ready.is_set() and bool(worker),
+            "cd2_enabled": self._enable_cd2,
             "push_connected": self._push_connected,
             "cd2_authenticated": self._cd2_authenticated,
             "cd2_version": self._cd2_version,
@@ -619,12 +657,18 @@ class CloudDrivePlexSync(_PluginBase):
             return {"success": False, "message": str(exc)}
 
     async def _api_resync_async(self, cloud_path: str) -> Dict[str, Any]:
-        if not self._worker or not self._client:
+        if not self._worker:
             raise RuntimeError("插件尚未就绪")
         path = self._worker.mapper.validate_cloud_path(cloud_path)
-        await self._client.force_list(path)
+        refreshed = False
+        if self._client:
+            await self._client.force_list(path)
+            refreshed = True
         queued = self._worker.submit_scan_directory(path, "manual")
-        return {"success": queued, "data": {"cloud_path": path}}
+        return {
+            "success": queued,
+            "data": {"cloud_path": path, "cd2_refreshed": refreshed},
+        }
 
     def api_resync(self, request: ResyncRequest) -> Dict[str, Any]:
         try:
@@ -648,6 +692,8 @@ class CloudDrivePlexSync(_PluginBase):
         return {"success": True, "message": "已请求重连"}
 
     def api_restore_buffer(self) -> Dict[str, Any]:
+        if not self._enable_cd2:
+            return {"success": False, "message": "CD2 联动未启用"}
         try:
             restored = self._submit(self._buffer.restore_all() if self._buffer else None)
             return {"success": True, "data": {"restored": restored}}
@@ -672,6 +718,8 @@ class CloudDrivePlexSync(_PluginBase):
         return await self._buffer.preview(cloud, [plex_path])
 
     def api_preview_buffer(self, request: PreviewBufferRequest) -> Dict[str, Any]:
+        if not self._enable_cd2:
+            return {"success": False, "message": "CD2 联动未启用"}
         try:
             data = self._submit(self._preview_buffer_async(request.cloud_path))
             return {"success": True, "data": data}
@@ -746,6 +794,8 @@ class CloudDrivePlexSync(_PluginBase):
                 props["persistent-hint"] = True
             if model in {"cd2_token", "ttd_cookie"}:
                 props["type"] = "password"
+            if model in {"cd2_url", "cd2_token"}:
+                props["show"] = "{{ enable_cd2 }}"
             if model == "plex_server":
                 props["items"] = self._media_server_names()
             if model == "buffer_mode":
@@ -766,6 +816,16 @@ class CloudDrivePlexSync(_PluginBase):
                 ]
             if model.startswith("ttd_") and model != "enable_ttd":
                 props["show"] = "{{ enable_ttd }}"
+            if model == "ttd_force_refresh":
+                props["show"] = "{{ enable_ttd && enable_cd2 }}"
+            if model in {
+                "enable_push",
+                "enable_transfer_event",
+                "plex_path_overrides",
+                "moviepilot_path_overrides",
+                "buffer_mode",
+            }:
+                props["show"] = "{{ enable_cd2 }}"
             if model in {
                 "scan_buffer_mb",
                 "buffer_min_mb",
@@ -776,9 +836,9 @@ class CloudDrivePlexSync(_PluginBase):
                 "buffer_restore_enabled",
                 "buffer_fail_open",
             }:
-                props["show"] = "{{ buffer_mode !== 'disabled' }}"
+                props["show"] = "{{ enable_cd2 && buffer_mode !== 'disabled' }}"
             if model == "playback_scan_buffer_mb":
-                props["show"] = "{{ buffer_mode === 'adaptive' }}"
+                props["show"] = "{{ enable_cd2 && buffer_mode === 'adaptive' }}"
             if model in {
                 "debounce_seconds",
                 "buffer_min_mb",
@@ -849,7 +909,8 @@ class CloudDrivePlexSync(_PluginBase):
         basic = [
             section(
                 "CloudDrive2 连接",
-                "配置 CD2 服务地址和最小权限 API Token。",
+                "仅在需要 CD2 推送、目录刷新、入库事件或 Buffer 联动时启用。",
+                field("VSwitch", "enable_cd2", "启用 CloudDrive2 联动", lg=12),
                 field("VTextField", "cd2_url", "CloudDrive2 地址", "http://NAS_IP:19798"),
                 field(
                     "VTextField",
@@ -877,23 +938,26 @@ class CloudDrivePlexSync(_PluginBase):
                     "type": "info",
                     "variant": "tonal",
                     "class": "mb-4 rounded-lg",
-                    "text": "监听根目录填写 CD2 云端路径；Plex 路径只填写在路径映射中。",
+                    "text": (
+                        "监听根目录填写云端逻辑路径；Plex 路径只填写在路径映射中。"
+                        "关闭 CD2 联动时，必须配置覆盖 TTD 目标根目录的直接映射。"
+                    ),
                 },
             },
             section(
                 "监听范围与直接映射",
-                "推荐直接把 CD2 云端路径映射到 Plex 容器内路径。",
+                "直接把云端逻辑路径映射到 Plex 容器内路径；TTD-only 模式必须配置。",
                 field(
                     "VTextarea",
                     "watch_roots",
-                    "CD2 监听根目录（每行一个）",
+                    "云端逻辑路径监听根目录（每行一个）",
                     "/光鸭云盘/Media/Video/已整理",
                     lg=12,
                 ),
                 field(
                     "VTextarea",
                     "cloud_plex_path_overrides",
-                    "CD2 云端路径 → Plex 路径（推荐）",
+                    "云端逻辑路径 → Plex 路径（推荐）",
                     "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya",
                     hint="优先使用，不依赖 CD2 挂载目录结构；按最长路径前缀匹配。",
                     lg=12,
@@ -934,7 +998,7 @@ class CloudDrivePlexSync(_PluginBase):
                     "type": "info",
                     "variant": "tonal",
                     "class": "mb-4 rounded-lg",
-                    "text": "目标根目录必须是 CD2 云端路径，例如 /光鸭云盘/Media/Video/已整理。",
+                    "text": "目标根目录填写 TTD 返回路径所属的云端逻辑根，例如 /光鸭云盘/Media/Video/已整理。",
                 },
             },
             section(
@@ -947,7 +1011,7 @@ class CloudDrivePlexSync(_PluginBase):
                 field(
                     "VTextField",
                     "ttd_target_root",
-                    "TgToDrive 目标根目录（CD2 云端路径）",
+                    "TgToDrive 目标根目录（云端逻辑路径）",
                     "/光鸭云盘/Media/Video/已整理",
                 ),
             ),
@@ -1091,6 +1155,7 @@ class CloudDrivePlexSync(_PluginBase):
         ]
         defaults = {
             "enabled": False,
+            "enable_cd2": True,
             "cd2_url": "http://127.0.0.1:19798",
             "cd2_token": "",
             "verify_tls": True,
@@ -1148,6 +1213,10 @@ class CloudDrivePlexSync(_PluginBase):
         status = self._status_data()
         ttd = status.get("ttd") or {}
         healthy = bool(status["push_connected"] or ttd.get("authenticated"))
+        if not status["cd2_enabled"]:
+            cd2_text = "未启用"
+        else:
+            cd2_text = "已连接" if status["push_connected"] else "未连接"
         return [
             {
                 "component": "VAlert",
@@ -1155,7 +1224,7 @@ class CloudDrivePlexSync(_PluginBase):
                     "type": "success" if healthy else "warning",
                     "variant": "tonal",
                     "text": (
-                        f"CD2推送：{'已连接' if status['push_connected'] else '未连接'}；"
+                        f"CD2推送：{cd2_text}；"
                         f"TTD：{'已认证' if ttd.get('authenticated') else ('未启用' if not ttd.get('enabled') else '未连接')}；"
                         f"TTD跳过：{int(ttd.get('skipped_records') or 0)}；"
                         f"待扫描：{status['pending_scans']}；Buffer模式：{status['buffer_mode']}"

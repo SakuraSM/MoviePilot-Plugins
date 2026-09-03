@@ -85,7 +85,7 @@ class EventWorker:
         self,
         mapper: PathMapper,
         plex: PlexBridge,
-        buffer_manager: BufferManager,
+        buffer_manager: Optional[BufferManager],
         cloud_apis: Sequence[CloudApi],
         *,
         debounce_seconds: int = 30,
@@ -204,7 +204,11 @@ class EventWorker:
             cloud = next((item for item in self.cloud_apis if item.identity == identity), None)
             prefixes = [item.plex_path for item in group]
             sections = {item.section_id for item in group}
-            may_scan = await self.buffer_manager.prepare(cloud, prefixes, sections)
+            may_scan = (
+                await self.buffer_manager.prepare(cloud, prefixes, sections)
+                if self.buffer_manager
+                else True
+            )
             if not may_scan:
                 for item in group:
                     self.coalescer.add(item)

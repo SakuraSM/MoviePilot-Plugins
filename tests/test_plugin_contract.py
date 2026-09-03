@@ -80,11 +80,12 @@ class PluginContractTests(unittest.TestCase):
         form, defaults = plugin.get_form()
         apis = plugin.get_api()
 
-        self.assertEqual(plugin.plugin_version, "1.3.0")
+        self.assertEqual(plugin.plugin_version, "1.3.1")
         self.assertEqual(len(apis), 7)
         self.assertTrue(all(item["auth"] == "bear" for item in apis))
         self.assertEqual(defaults["buffer_mode"], "adaptive")
         self.assertEqual(defaults["buffer_min_mb"], 1)
+        self.assertTrue(defaults["enable_cd2"])
         self.assertFalse(defaults["enable_ttd"])
         self.assertEqual(defaults["ttd_initial_mode"], "baseline")
         self.assertEqual(defaults["ttd_unmatched_policy"], "skip")
@@ -129,6 +130,114 @@ class PluginContractTests(unittest.TestCase):
         self.assertTrue(
             all(item["props"].get("variant") == "outlined" for item in text_fields)
         )
+        fields_by_model = {
+            item["props"]["model"]: item["props"]
+            for item in nodes
+            if (item.get("props") or {}).get("model")
+        }
+        self.assertEqual(fields_by_model["cd2_url"]["show"], "{{ enable_cd2 }}")
+        self.assertEqual(fields_by_model["buffer_mode"]["show"], "{{ enable_cd2 }}")
+        self.assertEqual(
+            fields_by_model["ttd_force_refresh"]["show"],
+            "{{ enable_ttd && enable_cd2 }}",
+        )
+
+    def test_ttd_only_configuration_does_not_require_cd2_credentials(self) -> None:
+        module = load_plugin_module()
+
+        class FakeThread:
+            def __init__(self, **_kwargs):
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        module.threading.Thread = FakeThread
+        root = "/光鸭云盘/Media/Video/已整理"
+        plugin = module.CloudDrivePlexSync()
+        plugin.init_plugin(
+            {
+                "enabled": True,
+                "enable_cd2": False,
+                "plex_server": "Plex",
+                "watch_roots": root,
+                "cloud_plex_path_overrides": f"{root} => /data/CloudNas/Guangya",
+                "enable_ttd": True,
+                "ttd_url": "https://ttd.example",
+                "ttd_cookie": "session=secret",
+                "ttd_source": "光鸭云盘",
+                "ttd_target_root": root,
+            }
+        )
+
+        self.assertTrue(plugin.get_state())
+        self.assertTrue(plugin._thread.started)
+        self.assertFalse(plugin._enable_push)
+        self.assertFalse(plugin._enable_transfer_event)
+        self.assertFalse(plugin._ttd_force_refresh)
+        self.assertEqual(plugin._buffer_settings.mode, "disabled")
+
+    def test_ttd_only_configuration_requires_direct_mapping_for_target_root(self) -> None:
+        module = load_plugin_module()
+        root = "/光鸭云盘/Media/Video/已整理"
+        plugin = module.CloudDrivePlexSync()
+        plugin.init_plugin(
+            {
+                "enabled": True,
+                "enable_cd2": False,
+                "plex_server": "Plex",
+                "watch_roots": root,
+                "cloud_plex_path_overrides": "",
+                "enable_ttd": True,
+                "ttd_url": "https://ttd.example",
+                "ttd_cookie": "session=secret",
+                "ttd_source": "光鸭云盘",
+                "ttd_target_root": root,
+            }
+        )
+
+        self.assertFalse(plugin.get_state())
+        self.assertIn("云端路径 → Plex 路径直接映射", plugin._last_error)
+
+    def test_ttd_only_supervisor_skips_cd2_client_and_topology(self) -> None:
+        module = load_plugin_module()
+
+        def unexpected_cd2_client(*_args, **_kwargs):
+            raise AssertionError("TTD-only mode must not construct a CD2 client")
+
+        async def run_supervisor():
+            root = "/光鸭云盘/Media/Video/已整理"
+            plugin = module.CloudDrivePlexSync()
+            plugin._enable_cd2 = False
+            plugin._enable_push = False
+            plugin._enable_ttd = False
+            plugin._watch_roots = [root]
+            plugin._plex_overrides = []
+            plugin._cloud_plex_overrides = module.parse_override_lines(
+                f"{root} => /data/CloudNas/Guangya"
+            )
+            plugin._moviepilot_overrides = []
+            plugin._resolve_plex = lambda: object()
+            module.CloudDriveClient = unexpected_cd2_client
+
+            task = asyncio.create_task(plugin._supervisor())
+            for _ in range(10):
+                if plugin._ready.is_set():
+                    break
+                await asyncio.sleep(0)
+            self.assertTrue(plugin._ready.is_set())
+            self.assertIsNone(plugin._client)
+            self.assertIsNone(plugin._buffer)
+            self.assertEqual(plugin._mounts, [])
+            self.assertEqual(plugin._cloud_apis, [])
+            plugin._stop_event.set()
+            await task
+
+        asyncio.run(run_supervisor())
 
     def test_failed_cd2_queue_is_not_used_to_suppress_ttd(self) -> None:
         module = load_plugin_module()
@@ -272,6 +381,41 @@ class PluginContractTests(unittest.TestCase):
 
         self.assertEqual(result.state.value, "queued")
         self.assertEqual(plugin._client.calls, [target])
+
+    def test_ttd_only_submission_queues_without_cd2_client(self) -> None:
+        module = load_plugin_module()
+        target = "/光鸭云盘/Media/Video/已整理/电影/片名"
+
+        class Mapper:
+            @staticmethod
+            def validate_cloud_path(path):
+                return path
+
+            @staticmethod
+            def cloud_to_plex(_path):
+                return "/data/CloudNas/Guangya/电影/片名"
+
+        class Worker:
+            mapper = Mapper()
+
+            @staticmethod
+            def submit_scan_directory(_path, _source):
+                return True
+
+        class Plex:
+            @staticmethod
+            def find_target(_path):
+                return object()
+
+        plugin = module.CloudDrivePlexSync()
+        plugin._worker = Worker()
+        plugin._plex = Plex()
+        plugin._client = None
+        plugin._ttd_force_refresh = False
+
+        result = asyncio.run(plugin._submit_ttd_directory(target, "ttd"))
+
+        self.assertEqual(result.state.value, "queued")
 
 
 if __name__ == "__main__":

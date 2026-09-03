@@ -144,3 +144,28 @@ class EventWorkerIntegrationTests(unittest.TestCase):
             section.updates,
             ["/data/CloudNas/Guangya/Media/Video/已整理/电影/片名"],
         )
+
+    def test_ttd_only_direct_mapping_scans_without_cd2_topology_or_buffer(self) -> None:
+        mapper = PathMapper(
+            watch_roots=["/光鸭云盘/Media/Video/已整理"],
+            mounts=[],
+            plex_overrides=[],
+            cloud_plex_overrides=parse_override_lines(
+                "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya"
+            ),
+        )
+        section = FakeSection()
+        section.locations = ["/data/CloudNas/Guangya"]
+        worker = EventWorker(
+            mapper,
+            PlexBridge(FakeService(FakePlex(section)), ["1"]),
+            None,
+            [],
+            debounce_seconds=30,
+            scans_per_second=1000,
+        )
+        directory = "/光鸭云盘/Media/Video/已整理/电影/片名"
+
+        self.assertTrue(worker.submit_scan_directory(directory, "ttd"))
+        self.assertEqual(asyncio.run(worker.flush(force=True)), 1)
+        self.assertEqual(section.updates, ["/data/CloudNas/Guangya/电影/片名"])

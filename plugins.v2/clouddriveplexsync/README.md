@@ -7,12 +7,15 @@ TgToDrive（TTD）的整理历史，将变化路径转换为 Plex 容器可见�
 ## 前置条件
 
 - MoviePilot V2 2.12.0 或更高版本。
-- CloudDrive2 1.0.14 Pro。
 - Plex Media Server 1.20.0.3125 或更高版本。
 - MoviePilot 已配置并连接 Plex。
-- CloudDrive2 的 FUSE 子挂载已经以 `rslave` 或 `shared` 传播给 Plex。
+- Plex 容器能够访问路径映射指向的实际媒体目录。
 
-CloudDrive2 API Token 只需要以下权限：
+CloudDrive2 是可选依赖。只有启用 CD2 推送、扫描前目录刷新、MoviePilot 入库事件或
+Buffer 联动时，才需要 CloudDrive2 1.0.14 Pro，并确保它的 FUSE 子挂载已经以 `rslave`
+或 `shared` 传播给 Plex。
+
+启用 CloudDrive2 联动时，API Token 只需要以下权限：
 
 - Push Messages
 - Get Mounts
@@ -21,6 +24,28 @@ CloudDrive2 API Token 只需要以下权限：
 - Modify Cloud APIs
 
 插件不需要 Read Files、Write、Rename 或 Delete 权限。
+
+## 仅使用 TgToDrive
+
+如果只需要根据 TTD 整理历史触发 Plex 局部扫描，可以完全不填写 CD2 地址和 Token：
+
+```text
+启用 CloudDrive2 联动：关闭
+启用 TgToDrive 整理历史轮询：开启
+TgToDrive 地址、Cookie、来源筛选：按实际环境填写
+TgToDrive 目标根目录：/光鸭云盘/Media/Video/已整理
+监听根目录：/光鸭云盘/Media/Video/已整理
+云端逻辑路径 → Plex 路径：
+/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya
+```
+
+关闭 CD2 联动后，插件不会创建 CD2 客户端，也不会读取 CD2 拓扑、订阅推送、刷新目录、
+处理 MoviePilot 入库事件或调整 Buffer。此模式必须配置覆盖 TTD 目标根目录的直接路径映射；
+不能使用依赖 CD2 MountPoint 的兼容映射。
+
+路径映射只负责把 TTD 的逻辑路径转换成 Plex 容器路径，不负责挂载媒体文件。如果 Plex
+实际仍通过 CloudDrive2 FUSE 读取媒体，CloudDrive2 服务和挂载仍需运行，只是不再需要向
+本插件提供 API 地址和 Token。
 
 ## TgToDrive 整理历史
 
@@ -63,7 +88,7 @@ Cookie 可以粘贴为 `session=...`，也兼容以 `Cookie:` 开头的完整请
 - TTD 地址、来源或目标根目录改变时自动建立新游标基线，避免跨数据源误去重。
 
 TTD 通常返回相对于整理目标根目录的路径，例如 `动漫/片名/Season 1`。插件将它拼接
-到“TgToDrive 目标根目录”，再执行 watch root、路径映射和 Plex Section 校验；任何一层
+到“TgToDrive 目标根目录”，再执行监听根目录、路径映射和 Plex Section 校验；任何一层
 不匹配都不会退化成整库扫描。配置了“CD2 云端路径 → Plex 路径”时会直接转换，不依赖
 CD2 挂载点；未命中直接映射时才使用 MountPoint 和旧的挂载路径覆盖作为兼容兜底。
 
@@ -77,7 +102,7 @@ CD2 云端路径。匹配按完整目录边界执行，`待整理-通用2` 不�
 不存在表示 TTD 地址或路径映射需要修正。刷新失败时仍会提交 Plex 局部扫描并保留错误记录。
 
 配置页按“基础、路径与触发、TgToDrive、Buffer、高级”五个标签页组织。TTD 目标根目录
-始终填写 CD2 云端路径；`/data/...` 形式的 Plex 容器路径只填写在 Plex 路径映射中。
+始终填写云端逻辑路径；`/data/...` 形式的 Plex 容器路径只填写在 Plex 路径映射中。
 
 ## 当前环境配置示例
 
