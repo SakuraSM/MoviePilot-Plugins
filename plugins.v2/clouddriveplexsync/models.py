@@ -1,56 +1,9 @@
-"""Shared data models for the CloudDrive/Plex synchronization plugin."""
+"""Plex scan requests and synchronization counters."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from enum import IntEnum
-from typing import Any, Dict, List, Optional
-
-
-class ChangeType(IntEnum):
-    """CloudDrive file-system change types."""
-
-    CREATE = 0
-    DELETE = 1
-    RENAME = 2
-
-
-@dataclass(frozen=True)
-class FileSystemChange:
-    """One file-system change received from CloudDrive."""
-
-    change_type: ChangeType
-    is_directory: bool
-    path: str
-    new_path: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class MountPoint:
-    """CloudDrive cloud-path to mounted-path relationship."""
-
-    mount_point: str
-    source_dir: str
-    local_mount: bool = False
-    read_only: bool = False
-    is_mounted: bool = False
-    name: str = ""
-
-
-@dataclass(frozen=True)
-class CloudApi:
-    """CloudDrive cloud provider/account descriptor."""
-
-    name: str
-    username: str
-    nickname: str = ""
-    path: str = ""
-    event_listener_running: bool = False
-    read_only: bool = False
-
-    @property
-    def identity(self) -> str:
-        return f"{self.name}|{self.username}"
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -71,43 +24,37 @@ class PendingScan:
     plex_path: str
     section_id: str
     section_title: str
-    cloud_identity: Optional[str]
     first_seen: float
     last_seen: float
-    sources: List[str] = field(default_factory=list)
-
-
-@dataclass
-class BufferLease:
-    """A recoverable lease for a temporary CloudDrive buffer value."""
-
-    cloud_name: str
-    username: str
-    original_mb: int
-    applied_mb: int
-    started_at: float
-    last_event_at: float
-    lease_id: str
-    section_ids: List[str] = field(default_factory=list)
-
-    @property
-    def cloud_identity(self) -> str:
-        return f"{self.cloud_name}|{self.username}"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    sources: list[str] = field(default_factory=list)
+    state: Literal["queued", "inflight"] = "queued"
 
     @classmethod
-    def from_dict(cls, value: Dict[str, Any]) -> "BufferLease":
+    def from_dict(cls, value: dict[str, object]) -> PendingScan:
+        paths = {}
+        for key in ("cloud_path", "plex_path", "section_id", "section_title"):
+            item = value.get(key)
+            if not isinstance(item, str) or not item:
+                raise ValueError(f"扫描队列字段无效：{key}")
+            paths[key] = item
+        first_seen, last_seen = value.get("first_seen"), value.get("last_seen")
+        if not isinstance(first_seen, (int, float)) or not isinstance(
+            last_seen, (int, float)
+        ):
+            raise TypeError("扫描队列时间字段无效")
+        sources = value.get("sources") or []
+        if not isinstance(sources, list) or not all(
+            isinstance(item, str) for item in sources
+        ):
+            raise TypeError("扫描队列来源字段无效")
         return cls(
-            cloud_name=str(value["cloud_name"]),
-            username=str(value.get("username") or ""),
-            original_mb=int(value["original_mb"]),
-            applied_mb=int(value["applied_mb"]),
-            started_at=float(value["started_at"]),
-            last_event_at=float(value["last_event_at"]),
-            lease_id=str(value["lease_id"]),
-            section_ids=[str(item) for item in value.get("section_ids") or []],
+            cloud_path=paths["cloud_path"],
+            plex_path=paths["plex_path"],
+            section_id=paths["section_id"],
+            section_title=paths["section_title"],
+            first_seen=first_seen,
+            last_seen=last_seen,
+            sources=[str(item) for item in sources],
         )
 
 
@@ -115,17 +62,12 @@ class BufferLease:
 class PluginStats:
     """Small runtime counter set exposed on the status page."""
 
-    cd2_unary_requests: int = 0
-    push_events: int = 0
     plex_scans: int = 0
-    reconnects: int = 0
-    unmapped_events: int = 0
-    buffer_changes: int = 0
     ttd_poll_requests: int = 0
     ttd_records: int = 0
     ttd_skipped_records: int = 0
     ttd_auth_failures: int = 0
     ttd_errors: int = 0
 
-    def to_dict(self) -> Dict[str, int]:
+    def to_dict(self) -> dict[str, int]:
         return asdict(self)

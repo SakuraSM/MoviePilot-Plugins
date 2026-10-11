@@ -1,184 +1,125 @@
-# CloudDrive Plex 增量同步
+# TgToDrive Plex 增量同步
 
-MoviePilot V2 插件。它订阅 CloudDrive2 Pro 的文件变化推送，也可以增量轮询
-TgToDrive（TTD）的整理历史，将变化路径转换为 Plex 容器可见路径，并只扫描发生变化
-的目录。插件不会读取媒体内容，也不会在空闲时轮询网盘目录。
+MoviePilot V2 插件。通过 TgToDrive OpenAPI 读取成功的整理记录，将目标目录映射为
+Plex 容器路径，再提交该目录的局部扫描。插件只查询整理历史，不读取媒体内容，也不遍历网盘。
+
+## 升级到 2.0.0
+
+插件 ID、目录和配置前缀仍为 `CloudDrivePlexSync`、`clouddriveplexsync` 和
+`clouddriveplexsync_`，现有安装可直接升级。
+
+2.0.0 仅保留 TgToDrive OpenAPI → Plex：
+
+- 移除 CloudDrive2 推送、目录刷新、拓扑查询和挂载点推导。
+- 移除 Buffer 调整、恢复和播放状态检测。
+- 移除 MoviePilot 入库事件、旧 Cookie 认证及相关配置、API。
+- 保留直接路径映射、目录去重、跳过规则、扫描限速和手动补扫。
+- 新增近期重叠回查、持久化去重账本、分批完整历史对账和执行中任务恢复。
+
+升级后填写 OpenAPI Token。旧 Cookie 不会转换为 Token。已有直接路径映射、Plex 服务、
+最近记录游标和待扫描队列会继续使用；依赖 CD2 MountPoint 的旧映射需要改为直接映射。
+
+首次运行会补扫去重账本尚未登记的历史目录，包括升级前未建立详细账本的记录。
+旧游标只作为翻页锚点，不会把仅知道 ID 的记录当作已核对的完整版本。
+同目录任务会合并，扫描按配置限速。默认不匹配 Plex 媒体库时保留并重试，旧配置显式选择
+`skip` 时仍按该策略跳过。
 
 ## 前置条件
 
 - MoviePilot V2 2.12.0 或更高版本。
-- Plex Media Server 1.20.0.3125 或更高版本。
-- MoviePilot 已配置并连接 Plex。
-- Plex 容器能够访问路径映射指向的实际媒体目录。
+- TgToDrive 已开启 OpenAPI，并创建有效 Token。
+- MoviePilot 已配置并连接 Plex，Plex 版本至少为 1.20.0.3125。
+- Plex 容器能够访问映射后的媒体目录。
 
-CloudDrive2 是可选依赖。只有启用 CD2 推送、扫描前目录刷新、MoviePilot 入库事件或
-Buffer 联动时，才需要 CloudDrive2 1.0.14 Pro，并确保它的 FUSE 子挂载已经以 `rslave`
-或 `shared` 传播给 Plex。
+插件不管理文件挂载。Plex 使用的挂载服务需要自行保持可用。
 
-启用 CloudDrive2 联动时，API Token 只需要以下权限：
+## 配置
 
-- Push Messages
-- Get Mounts
-- List Files
-- Get Cloud APIs
-- Modify Cloud APIs
-
-插件不需要 Read Files、Write、Rename 或 Delete 权限。
-
-## 仅使用 TgToDrive
-
-如果只需要根据 TTD 整理历史触发 Plex 局部扫描，可以完全不填写 CD2 地址和 Token：
+在 TTD 的“实用工具 → OpenAPI”创建 Token，再填写插件配置：
 
 ```text
-启用 CloudDrive2 联动：关闭
-启用 TgToDrive 整理历史轮询：开启
-TgToDrive 地址、Cookie、来源筛选：按实际环境填写
-TgToDrive 目标根目录：/光鸭云盘/Media/Video/已整理
-监听根目录：/光鸭云盘/Media/Video/已整理
-云端逻辑路径 → Plex 路径：
-/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya
-```
-
-关闭 CD2 联动后，插件不会创建 CD2 客户端，也不会读取 CD2 拓扑、订阅推送、刷新目录、
-处理 MoviePilot 入库事件或调整 Buffer。此模式必须配置覆盖 TTD 目标根目录的直接路径映射；
-不能使用依赖 CD2 MountPoint 的兼容映射。
-
-路径映射只负责把 TTD 的逻辑路径转换成 Plex 容器路径，不负责挂载媒体文件。如果 Plex
-实际仍通过 CloudDrive2 FUSE 读取媒体，CloudDrive2 服务和挂载仍需运行，只是不再需要向
-本插件提供 API 地址和 Token。
-
-## TgToDrive 整理历史
-
-TTD 主要负责整理资源时，可以启用 Cookie 认证的整理历史轮询。推荐配置：
-
-```text
-启用 TgToDrive 整理历史轮询：开启
+启用插件：开启
 TgToDrive 地址：https://ttd.nings.top
-TgToDrive 登录 Cookie：session=你的会话值
-TgToDrive 来源筛选：光鸭云盘
-TgToDrive 目标根目录：/光鸭云盘/Media/Video/已整理
-TgToDrive 跳过路径：待整理-通用、_整理中（每行一个，可选）
-不属于所选 Plex 媒体库时：跳过并推进游标
-TgToDrive 轮询间隔：30
-TgToDrive 每页记录数：20
-TgToDrive 最大补页数：5
-TgToDrive 首次运行：仅建立基线，不处理历史
-扫描前刷新准确的 CD2 目标目录：开启
-```
-
-Cookie 可以粘贴为 `session=...`，也兼容以 `Cookie:` 开头的完整请求头值。插件只把它
-放在 HTTPS 请求头中，不会写入运行日志、状态页或 URL。MoviePilot 配置存储是否加密
-取决于 MoviePilot 本身，因此建议使用权限尽可能小、可随时注销的 TTD 会话。
-“TgToDrive 地址”既可以填写站点根地址，也可以直接粘贴完整的
-`/api/organize-history?...` 地址；插件会移除已有查询参数并使用配置页中的筛选条件。
-
-默认首次连接只保存当前第一页作为基线，不会把既有历史重新送入 Plex。选择“处理
-当前最新记录”时才会处理第一页已有的成功记录。后续轮询采用以下保护：
-
-- 记录 ID 存在时以 ID 去重，否则根据目标、时间、来源和文件名生成稳定指纹。
-- 新记录超过一页时继续翻页，直到找到已保存游标，最多读取配置的补页数。
-- 达到最大补页数仍找不到游标时停止推进并报警，不会静默跳过缺口。
-- 同一批次多个记录落入同一目标目录时，只刷新和提交该目录一次。
-- 配置的跳过路径和不属于所选 Plex 媒体库的目标会记为一次 `SKIP` 并推进游标，
-  不发送错误通知，也不会阻塞后续正常记录。
-- Plex 暂时不可用、扫描队列已满等可恢复问题会保留游标并重试；相同原因只上报一次，
-  恢复或错误内容变化后才会重新上报。
-- `401/403` 或登录重定向会标记 Cookie 失效，并按 5、15、30、60 分钟退避。
-- 网络及服务端错误按 5、15、30、60 秒退避。
-- TTD 地址、来源或目标根目录改变时自动建立新游标基线，避免跨数据源误去重。
-
-TTD 通常返回相对于整理目标根目录的路径，例如 `动漫/片名/Season 1`。插件将它拼接
-到“TgToDrive 目标根目录”，再执行监听根目录、路径映射和 Plex Section 校验；任何一层
-不匹配都不会退化成整库扫描。配置了“CD2 云端路径 → Plex 路径”时会直接转换，不依赖
-CD2 挂载点；未命中直接映射时才使用 MountPoint 和旧的挂载路径覆盖作为兼容兜底。
-
-“TgToDrive 跳过路径”支持相对于目标根目录的路径（如 `待整理-通用`），也支持完整的
-CD2 云端路径。匹配按完整目录边界执行，`待整理-通用2` 不会误命中
-`待整理-通用`。默认的“不属于所选 Plex 媒体库时”策略为跳过；如确实希望等待媒体库
-配置修复后再处理，可改成“保留记录并持续重试”。
-
-开启“扫描前刷新准确的 CD2 目标目录”后，每个去重目录会调用一次
-`GetSubFiles(forceRefresh=true)`。插件只刷新 TTD 返回并映射后的准确目标目录；目标目录
-不存在表示 TTD 地址或路径映射需要修正。刷新失败时仍会提交 Plex 局部扫描并保留错误记录。
-
-配置页按“基础、路径与触发、TgToDrive、Buffer、高级”五个标签页组织。TTD 目标根目录
-始终填写云端逻辑路径；`/data/...` 形式的 Plex 容器路径只填写在 Plex 路径映射中。
-
-## 当前环境配置示例
-
-监听根目录：
-
-```text
-/光鸭云盘/Media/Video/已整理
-```
-
-推荐直接将 CD2 云端路径转换成 Plex 容器路径：
-
-```text
+TgToDrive API Token：你的 OpenAPI Token
+TgToDrive 来源：光鸭云盘
+Plex 服务：MoviePilot 中的 Plex 服务名
+Plex 媒体库 ID：1,2（留空允许该服务的全部媒体库）
+TTD 目标根目录：/光鸭云盘/Media/Video/已整理
+TTD 逻辑路径 → Plex 容器路径：
 /光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya
 ```
 
-以下旧式挂载路径映射继续保留为兼容兜底：
+TTD 目标根目录填写云端逻辑路径。Plex 容器路径只填写在映射右侧。
+多条映射按最长前缀匹配，并检查完整目录边界。目标越出根目录、包含 `..` 或无法匹配
+Plex 媒体库时，不会退化为整库扫描。
 
-```text
-/CloudNAS/Guangya => /data/CloudNas/Guangya
-```
+Token 支持原始值、`Bearer ...` 和 `Authorization: Bearer ...` 三种形式。
+插件只把 Token 放在 Authorization 请求头中，不写入 URL、状态页或运行日志。
+TTD 的 OpenAPI 凭据拥有后台管理员权限，请使用 HTTPS 并妥善保存，需要时在 TTD 撤销。
 
-如果 MoviePilot 也直接写 CloudDrive2 挂载目录，可配置：
+地址可以是服务根地址，也可以是完整的 `/api/organize-history?...` 地址。
+反向代理使用子路径时需要包含前缀，已有查询参数会被移除。
 
-```text
-/media/CloudNas/Guangya => /CloudNAS/Guangya
-```
+“跳过目录”支持相对于目标根目录的路径或完整逻辑路径，每行一条。
+跳过目录和显式选择跳过的不匹配媒体库记录会记账，不再自动重试。
+修改跳过规则不会自动重放已跳过记录，可通过手动补扫处理指定目录。
 
-路径映射使用最长前缀和完整目录边界，不会检查路径在 MoviePilot 容器中是否真实存在，
-因此删除事件也可以正常映射。
+## 防漏与恢复
 
-## Buffer 模式
+插件请求 `GET /api/organize-history`，传入 `source`、`page`、`limit` 和 `status=success`。
+默认配置如下：
 
-- `disabled`：不读取、不修改 CD2 Buffer。
-- `fixed`：扫描期间统一使用“空闲扫描 Buffer”。
-- `adaptive`：没有播放时使用空闲值；正在播放同一网盘内容时使用播放值。
+| 配置 | 默认值 | 行为 |
+|---|---:|---|
+| 轮询间隔 | 30 秒 | 快速发现新增成功记录 |
+| 每页记录数 | 100 | 单页查询量 |
+| 快轮询最大页数 | 5 | 限制单轮请求量 |
+| 遇到旧记录后继续回查 | 2 页 | 覆盖近期晚完成的旧记录 |
+| 完整历史对账间隔 | 6 小时 | 从上一次对账完成时计算 |
+| 完整历史对账批量 | 每轮最多 2 页 | 与快轮询共用周期，断点续跑 |
+| 同目录合并等待 | 30 秒 | 合并重复扫描请求 |
+| 每秒提交扫描数 | 1 | 限制 Plex 请求速率 |
+| 扫描队列容量 | 10,000 | 容量不足时保留整理记录重试 |
 
-默认空闲值是 2MB，播放值是 8MB。扫描结束并经过静默期后，插件恢复扫描前的值。
-恢复前会重新读取配置；如果用户已经手动修改 Buffer，插件不会覆盖用户的新值。
-“Buffer 最小值”默认是 1MB，并同时约束全局值和网盘级覆盖；实际最大值会按 CD2
-`maxBufferPoolSizeMBLimit` 自动截断。
+通常无新记录时，快轮询读取 3 页。历史对账进行中每轮再读取最多 2 页。
+增加回查窗口或缩短轮询间隔会增加 TTD 查询量，不会增加网盘目录遍历。
 
-可以按网盘覆盖全局值：
+处理记录后，将记录 ID、目标路径、事件时间和状态对应的版本保存到插件数据目录中的
+`history.sqlite3`。账本不受最近 1,000 个游标 ID 的限制。同一 ID 的目标或事件时间变化时，
+会作为新版本重新处理。
 
-```text
-光鸭云盘|2|8
-OneDrive|4|16
-```
+快轮询遇到已处理 ID 后仍检查当前页，并继续回查配置的页数。窗口之外晚成功的记录由
+完整历史对账补查。达到快轮询页数上限仍未找到旧游标时，会记录历史缺口并启动分批对账，
+不会把当前窗口视为已经补齐全部历史。
 
-标识可使用 `网盘类型|账号`、云端路径、昵称或网盘类型。
+对账每处理完一页才保存下一页页码；提交失败时停留在当前页。重启后从已保存的位置继续。
+队列接受任务并持久化后，才将整理记录记入账本。账本写入前中断可能导致重复提交，目录
+队列会合并这些重复任务。
 
-## Plex 设置建议
+扫描任务执行前会持久化为 `inflight`。Plex 接受局部扫描请求后，任务才从队列移除。
+重启时 `queued` 和 `inflight` 都恢复为待执行任务。扫描期间同目录出现的新变化会保留为
+下一次扫描任务。单个目录失败不会阻塞其它目录。
+旧队列格式无效或恢复任务超过配置容量时，插件拒绝启动并报告原因，不会静默丢弃任务。
 
-对于网盘媒体库建议关闭：
+这里保证的是扫描请求可重试，Plex 接受请求不等于媒体索引已经完成。
+服务端当前提供页码分页，未提供快照或稳定增量事件游标。对账期间数据可能变化，因此
+不能承诺任意并发修改下绝对不漏；记录在服务端保留足够时间、接口可用且任务最终成功时，
+周期对账会持续补查。源记录在查询前被删除或清理后，插件无法恢复其内容。
 
-- 自动扫描媒体库
-- 周期扫描
-- 扫描后自动清空垃圾箱
-- 深度媒体分析
-- 自动生成视频预览缩略图
-
-插件直接调用 Plex 的 `LibrarySection.update(path=...)`。路径无法匹配已选择的 Plex
-媒体库时会拒绝处理，不会回退为整库扫描。
+`401/403` 和登录重定向按 5、15、30、60 分钟退避；网络错误按 5、15、30、60 秒退避。
+恢复期间保留游标、账本和待扫描队列。
 
 ## 插件 API
 
-所有接口都需要 MoviePilot Bearer 认证：
+所有接口需要 MoviePilot Bearer 认证，插件 ID 仍为 `CloudDrivePlexSync`：
 
-- `GET /api/v1/plugin/CloudDrivePlexSync/status`
-- `POST /api/v1/plugin/CloudDrivePlexSync/test`
-- `POST /api/v1/plugin/CloudDrivePlexSync/flush`
-- `POST /api/v1/plugin/CloudDrivePlexSync/resync`
-- `POST /api/v1/plugin/CloudDrivePlexSync/reconnect`
-- `POST /api/v1/plugin/CloudDrivePlexSync/restore-buffer`
-- `POST /api/v1/plugin/CloudDrivePlexSync/preview-buffer`
+- `GET /api/v1/plugin/CloudDrivePlexSync/status`：查询认证、队列、对账进度和最近记录。
+- `POST /api/v1/plugin/CloudDrivePlexSync/test`：验证 TTD 历史查询与 Plex 连接。
+- `POST /api/v1/plugin/CloudDrivePlexSync/flush`：立即处理当前待扫描目录。
+- `POST /api/v1/plugin/CloudDrivePlexSync/resync`：手动提交一个准确目录。
+- `POST /api/v1/plugin/CloudDrivePlexSync/reconcile`：从第一页重新启动历史对账，按账本去重。
 
-手动补扫请求：
+手动补扫请求示例：
 
 ```json
 {
@@ -186,26 +127,18 @@ OneDrive|4|16
 }
 ```
 
-补扫只强制重新列出指定目标目录一次，然后提交相同目录的 Plex 局部扫描，不会递归遍历。
-
-## 请求量与限制
-
-未启用 TTD 时，空闲只有一条 `PushMessage` 长连接，不调用 `GetSubFiles`。启用 TTD
-后，每个轮询周期增加一次 TTD 历史 HTTP 请求；30 秒间隔约为每小时 120 次。正常无
-新记录时不访问 CD2 目录，也不触发 Plex。发现新记录后，每个去重目标目录最多增加
-一次 CD2 精确刷新和一次 Plex 本地局部扫描。
-
-CD2 推送协议没有事件游标。断线期间可能漏掉外部网盘变化，恢复连接后插件不会自动
-遍历整个网盘；状态页会保留断线时间，此时应对已知目录执行一次手动补扫。
-
-如果 `isCloudEventListenerRunning` 为 false，说明对应网盘当前没有云端事件监听，外部
-变化无法保证近实时。
+状态中的 `audit_next_page=0` 表示本轮对账结束，其它值为下一页页码。
+`history_gap` 表示快轮询曾未找到旧游标，完成一轮对账后清除。
+`inflight_scans` 表示正在向 Plex 提交的任务数量。
 
 ## 开发验证
 
-插件核心模块不依赖 MoviePilot 即可运行单元测试：
+核心测试使用临时 SQLite、模拟 HTTP 与 Plex，不会修改真实媒体库：
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q plugins.v2/clouddriveplexsync
 ```
+
+仓库中的 `.env` 和 `.env.*` 只用于本地验证，并已加入 Git 忽略规则。
+插件运行时使用 MoviePilot 配置页的 Token，不自动读取开发目录中的凭据文件。

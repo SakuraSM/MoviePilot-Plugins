@@ -29,7 +29,7 @@ class FakeLibrary:
 
 class FakePlex:
     version = "1.40.4.8679"
-    activities = []
+    activities = ()
 
     def __init__(self, sections) -> None:
         self.library = FakeLibrary(sections)
@@ -50,7 +50,9 @@ class PlexBridgeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.movies = FakeSection("1", "Movies", ["/data/CloudNas/Movies"])
         self.tv = FakeSection("2", "TV", ["/data/CloudNas/TV"])
-        self.bridge = PlexBridge(FakeService(FakePlex([self.movies, self.tv])), ["1", "2"])
+        self.bridge = PlexBridge(
+            FakeService(FakePlex([self.movies, self.tv])), ["1", "2"]
+        )
 
     def test_exact_partial_scan(self) -> None:
         target = self.bridge.find_target("/data/CloudNas/Movies/Film")
@@ -63,9 +65,3 @@ class PlexBridgeTests(unittest.TestCase):
             self.bridge.find_target("/data/Elsewhere/Film")
         self.assertEqual(self.movies.updates, [])
         self.assertEqual(self.tv.updates, [])
-
-    def test_activities_method_is_supported(self) -> None:
-        plex = FakePlex([self.movies])
-        plex.activities = lambda: [type("Activity", (), {"type": "library.refresh"})()]
-        bridge = PlexBridge(FakeService(plex), ["1"])
-        self.assertTrue(bridge.is_scanning(["1"]))

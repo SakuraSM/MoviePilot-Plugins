@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-import asyncio
 import unittest
 
 import _bootstrap  # noqa: F401
-from clouddriveplexsync.models import PluginStats
 from clouddriveplexsync.ttd_client import (
     TTDAuthenticationError,
     TTDClient,
     TTDCursor,
     TTDHistoryGapError,
+    TTDHistoryPage,
     TTDHistoryPoller,
     TTDHistoryRecord,
-    TTDHistoryPage,
     TTDProtocolError,
     TTDSubmitResult,
-    parse_ttd_skip_paths,
     parse_history_payload,
+    parse_ttd_skip_paths,
 )
 
 
@@ -142,32 +140,22 @@ class TTDParserTests(unittest.TestCase):
 
     def test_nonempty_unknown_record_shape_fails_closed_in_client_parser(self):
         # The low-level parser skips unsupported rows; TTDClient checks the raw count.
-        self.assertEqual(parse_history_payload({"items": [{"id": 1, "status": "success"}]}), [])
+        self.assertEqual(
+            parse_history_payload({"items": [{"id": 1, "status": "success"}]}), []
+        )
 
 
 class TTDClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cookie_is_sent_without_being_added_to_url(self):
+    async def test_unauthorized_response_is_classified_as_token_failure(self):
         transport = FakeHTTPClient(
-            FakeResponse(payload={"success": True, "items": []})
+            FakeResponse(status_code=401, payload={"success": False})
         )
-        stats = PluginStats()
         client = TTDClient(
             "https://ttd.example",
-            "Cookie: session=secret",
-            "光鸭云盘",
-            stats=stats,
+            source="光鸭云盘",
+            api_token="test-token",
             client=transport,
         )
-        self.assertEqual((await client.fetch_page(1)).records, [])
-        url, kwargs = transport.calls[0]
-        self.assertNotIn("secret", url)
-        self.assertEqual(kwargs["headers"]["cookie"], "session=secret")
-        self.assertEqual(kwargs["params"]["status"], "success")
-        self.assertEqual(stats.ttd_poll_requests, 1)
-
-    async def test_unauthorized_response_is_classified_as_cookie_failure(self):
-        transport = FakeHTTPClient(FakeResponse(status_code=401, payload={"success": False}))
-        client = TTDClient("https://ttd.example", "session=expired", "光鸭云盘", client=transport)
         with self.assertRaises(TTDAuthenticationError):
             await client.fetch_page(1)
 
@@ -175,18 +163,27 @@ class TTDClientTests(unittest.IsolatedAsyncioTestCase):
         transport = FakeHTTPClient(FakeResponse(payload={"success": True, "items": []}))
         client = TTDClient(
             "https://ttd.example/api/organize-history?source=old&page=9",
-            "session=secret",
-            "光鸭云盘",
+            source="光鸭云盘",
+            api_token="test-token",
             client=transport,
         )
         await client.fetch_page(1)
-        self.assertEqual(transport.calls[0][0], "https://ttd.example/api/organize-history")
+        self.assertEqual(
+            transport.calls[0][0], "https://ttd.example/api/organize-history"
+        )
 
     async def test_unknown_nonempty_record_shape_is_rejected(self):
         transport = FakeHTTPClient(
-            FakeResponse(payload={"success": True, "items": [{"id": 1, "status": "success"}]})
+            FakeResponse(
+                payload={"success": True, "items": [{"id": 1, "status": "success"}]}
+            )
         )
-        client = TTDClient("https://ttd.example", "session=secret", "光鸭云盘", client=transport)
+        client = TTDClient(
+            "https://ttd.example",
+            source="光鸭云盘",
+            api_token="test-token",
+            client=transport,
+        )
         with self.assertRaises(TTDProtocolError):
             await client.fetch_page(1)
 
@@ -210,22 +207,34 @@ class TTDClientTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        client = TTDClient("https://ttd.example", "session=secret", "光鸭云盘", client=transport)
+        client = TTDClient(
+            "https://ttd.example",
+            source="光鸭云盘",
+            api_token="test-token",
+            client=transport,
+        )
         page = await client.fetch_page(1)
         self.assertFalse(page.has_next)
         self.assertEqual(page.records[0].record_id, "269364")
 
     async def test_source_data_error_is_rejected(self):
         transport = FakeHTTPClient(
-            FakeResponse(payload={"source_data": {"error": "database busy", "records": []}})
+            FakeResponse(
+                payload={"source_data": {"error": "database busy", "records": []}}
+            )
         )
-        client = TTDClient("https://ttd.example", "session=secret", "光鸭云盘", client=transport)
+        client = TTDClient(
+            "https://ttd.example",
+            source="光鸭云盘",
+            api_token="test-token",
+            client=transport,
+        )
         with self.assertRaises(TTDProtocolError):
             await client.fetch_page(1)
 
 
 class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_first_poll_establishes_baseline_without_scanning(self):
+    async def test_first_poll_processes_existing_successful_records(self):
         client = FakeHistoryClient({1: [record("2", "电影/B"), record("1", "电影/A")]})
         submitted = []
         persisted = []
@@ -235,12 +244,14 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             "/光鸭云盘/Media/Video/已整理",
             persist_cursor=persisted.append,
         )
-        self.assertEqual(await poller.poll_once(), 0)
-        self.assertEqual(submitted, [])
+        self.assertEqual(await poller.poll_once(), 2)
+        self.assertEqual(len(submitted), 2)
         self.assertTrue(persisted[-1]["initialized"])
         self.assertEqual(set(persisted[-1]["seen_keys"]), {"id:1", "id:2"})
 
-    async def test_new_records_are_oldest_first_and_same_directory_is_deduplicated(self):
+    async def test_new_records_are_oldest_first_and_same_directory_is_deduplicated(
+        self,
+    ):
         client = FakeHistoryClient(
             {
                 1: [
@@ -269,7 +280,9 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(poller.cursor.seen_keys[:2], ["id:3", "id:2"])
 
-    async def test_permanently_skipped_record_advances_cursor_without_blocking_newer_records(self):
+    async def test_permanently_skipped_record_advances_cursor_without_blocking_newer_records(
+        self,
+    ):
         client = FakeHistoryClient(
             {
                 1: [
@@ -308,7 +321,9 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await poller.poll_once(), 0)
         self.assertEqual(submitted, [])
 
-    async def test_retryable_rejection_is_reported_once_and_does_not_advance_cursor(self):
+    async def test_retryable_rejection_is_reported_once_and_does_not_advance_cursor(
+        self,
+    ):
         client = FakeHistoryClient(
             {1: [record("2", "电影/新片"), record("1", "电影/旧片")]}
         )
@@ -329,7 +344,9 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
 
     def test_skip_paths_support_relative_prefixes_and_path_boundaries(self):
         root = "/光鸭云盘/Media/Video/已整理"
-        paths = parse_ttd_skip_paths("待整理-通用\n/光鸭云盘/Media/Video/已整理/_整理中", root)
+        paths = parse_ttd_skip_paths(
+            "待整理-通用\n/光鸭云盘/Media/Video/已整理/_整理中", root
+        )
         self.assertEqual(
             paths,
             [
@@ -338,7 +355,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_cursor_scope_change_establishes_a_new_baseline(self):
+    async def test_cursor_scope_change_reprocesses_new_source(self):
         client = FakeHistoryClient({1: [record("2", "电影/B")]})
         client.base_url = "https://ttd.example"
         client.source = "光鸭云盘"
@@ -349,8 +366,8 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             "/光鸭云盘/Media/Video/已整理",
             cursor=TTDCursor(initialized=True, scope="old-scope", seen_keys=["id:1"]),
         )
-        self.assertEqual(await poller.poll_once(), 0)
-        self.assertEqual(submitted, [])
+        self.assertEqual(await poller.poll_once(), 1)
+        self.assertEqual(len(submitted), 1)
         self.assertNotEqual(poller.cursor.scope, "old-scope")
 
     async def test_missing_cursor_at_page_limit_fails_closed(self):
@@ -378,7 +395,6 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             lambda _path, _source: True,
             "/光鸭云盘/Media/Video/已整理",
             cursor=TTDCursor(initialized=True, seen_keys=[]),
-            initial_mode="replay_latest",
             on_skip=skipped.append,
         )
         self.assertEqual(await poller.poll_once(), 0)

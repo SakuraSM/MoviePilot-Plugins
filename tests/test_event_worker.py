@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import threading
 import unittest
 
 import _bootstrap  # noqa: F401
 from clouddriveplexsync.event_worker import EventWorker, ScanCoalescer
-from clouddriveplexsync.models import ChangeType, CloudApi, FileSystemChange, MountPoint, PendingScan
-from clouddriveplexsync.path_mapper import PathMapper, parse_override_lines
+from clouddriveplexsync.models import PendingScan
+from clouddriveplexsync.path_mapper import PathMapper
 from clouddriveplexsync.plex_bridge import PlexBridge
+from test_plex_bridge import FakePlex, FakeSection, FakeService
 
 
 def pending(path: str, seen: float = 0) -> PendingScan:
@@ -16,10 +19,9 @@ def pending(path: str, seen: float = 0) -> PendingScan:
         plex_path=path,
         section_id="1",
         section_title="Movies",
-        cloud_identity="Cloud|user",
         first_seen=seen,
         last_seen=seen,
-        sources=["cd2"],
+        sources=["ttd"],
     )
 
 
@@ -36,7 +38,9 @@ class ScanCoalescerTests(unittest.TestCase):
         queue = ScanCoalescer()
         queue.add(pending("/shows/A/Season 1"))
         queue.add(pending("/shows/A"))
-        self.assertEqual([item.plex_path for item in queue.pending.values()], ["/shows/A"])
+        self.assertEqual(
+            [item.plex_path for item in queue.pending.values()], ["/shows/A"]
+        )
 
     def test_siblings_are_not_promoted_to_common_root(self) -> None:
         queue = ScanCoalescer()
@@ -45,127 +49,158 @@ class ScanCoalescerTests(unittest.TestCase):
         self.assertEqual(len(queue.pending), 2)
 
 
-class FakeSection:
-    key = "1"
-    title = "Movies"
-    locations = ["/data/CloudNas/Guangya/Media/Video/已整理"]
-    refreshing = False
-
-    def __init__(self) -> None:
-        self.updates = []
-
-    def update(self, path=None) -> None:
-        self.updates.append(path)
-
-
-class FakePlex:
-    version = "1.40.0.0"
-    activities = []
-
-    def __init__(self, section) -> None:
-        self.library = type("Library", (), {"sections": lambda _self: [section]})()
-
-    def sessions(self):
-        return []
-
-
-class FakeService:
-    def __init__(self, plex) -> None:
-        self._plex = plex
-
-    def get_plex(self):
-        return self._plex
-
-
-class FakeBufferManager:
-    def __init__(self) -> None:
-        self.prepared = []
-
-    async def prepare(self, cloud, prefixes, sections):
-        self.prepared.append((cloud.identity, list(prefixes), set(sections)))
-        return True
-
-
-class EventWorkerIntegrationTests(unittest.TestCase):
-    def test_change_becomes_one_exact_plex_scan(self) -> None:
-        mapper = PathMapper(
-            watch_roots=["/光鸭云盘/Media/Video/已整理"],
-            mounts=[MountPoint("/CloudNAS/Guangya", "/光鸭云盘", is_mounted=True)],
-            plex_overrides=parse_override_lines(
-                "/CloudNAS/Guangya => /data/CloudNas/Guangya"
-            ),
-        )
-        section = FakeSection()
-        bridge = PlexBridge(FakeService(FakePlex(section)), ["1"])
-        buffer_manager = FakeBufferManager()
-        worker = EventWorker(
-            mapper,
+class ScanWorkerTests(unittest.IsolatedAsyncioTestCase):
+    def make_worker(self, persist=None, capacity=10000):
+        self.section = FakeSection("1", "Movies", ["/plex"])
+        bridge = PlexBridge(FakeService(FakePlex([self.section])), ["1"])
+        return EventWorker(
+            PathMapper("/cloud", [("/cloud", "/plex")]),
             bridge,
-            buffer_manager,
-            [CloudApi("GuangYaPan", "u", path="/光鸭云盘")],
-            debounce_seconds=30,
-            scans_per_second=1000,
+            persist_queue=persist,
+            scans_per_second=10000,
+            capacity=capacity,
         )
-        worker.submit_change(
-            FileSystemChange(
-                ChangeType.CREATE,
-                False,
-                "/光鸭云盘/Media/Video/已整理/电影/片名/movie.mkv",
-            )
-        )
-        self.assertEqual(asyncio.run(worker.flush(force=True)), 1)
+
+    async def test_exact_directory_is_scanned_without_promoting_parent(self) -> None:
+        snapshots = []
+        worker = self.make_worker(snapshots.append)
+        self.assertTrue(await worker.submit_scan_directory("/cloud/电影/片名"))
+        self.assertEqual(await worker.flush(force=True), 1)
+        self.assertEqual(self.section.updates, ["/plex/电影/片名"])
+        self.assertEqual(snapshots[-1], [])
+
+    async def test_crash_snapshot_retains_inflight_job_for_restart(self) -> None:
+        snapshots = []
+        worker = self.make_worker(snapshots.append)
+        await worker.submit_scan_directory("/cloud/电影/片名")
+        crash_snapshot = []
+
+        def interrupted_scan(_target):
+            crash_snapshot.extend(copy.deepcopy(snapshots[-1]))
+            raise asyncio.CancelledError("interrupted before Plex accepted request")
+
+        worker.plex.scan = interrupted_scan
+        with self.assertRaises(asyncio.CancelledError):
+            await worker.flush(force=True)
+        self.assertEqual(crash_snapshot[0]["state"], "inflight")
+        restarted = self.make_worker(snapshots.append)
+        restarted.load_queue(crash_snapshot)
+        self.assertEqual(await restarted.flush(force=True), 1)
+        self.assertEqual(self.section.updates, ["/plex/电影/片名"])
+
+    async def test_persistence_failure_prevents_scan_and_retains_job(self) -> None:
+        worker = self.make_worker()
+        await worker.submit_scan_directory("/cloud/电影/片名")
+
+        def fail_save(_values):
+            raise OSError("storage unavailable")
+
+        worker.persist_queue = fail_save
+        with self.assertRaises(OSError):
+            await worker.flush(force=True)
+        self.assertEqual(self.section.updates, [])
+        self.assertEqual(len(worker.coalescer.pending), 1)
+
+    async def test_new_change_during_scan_is_kept_for_another_scan(self) -> None:
+        snapshots = []
+        worker = self.make_worker(snapshots.append)
+        await worker.submit_scan_directory("/cloud/电影/片名")
+        started, release = threading.Event(), threading.Event()
+        original_scan = worker.plex.scan
+
+        def blocking_scan(target):
+            started.set()
+            release.wait(timeout=5)
+            original_scan(target)
+
+        worker.plex.scan = blocking_scan
+        task = asyncio.create_task(worker.flush(force=True))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            self.assertTrue(await worker.submit_scan_directory("/cloud/电影/片名"))
+        finally:
+            release.set()
+        await task
+        self.assertEqual(len(worker.coalescer.pending), 1)
+        self.assertEqual(len(snapshots[-1]), 1)
+        self.assertEqual(await worker.flush(force=True), 1)
+        self.assertEqual(len(self.section.updates), 2)
+
+    async def test_cancelled_flush_requeues_all_unfinished_jobs(self) -> None:
+        snapshots = []
+        worker = self.make_worker(snapshots.append)
+        await worker.submit_scan_directory("/cloud/电影/A")
+        await worker.submit_scan_directory("/cloud/电影/B")
+        worker.scan_interval = 100
+        task = asyncio.create_task(worker.flush(force=True))
+        for _ in range(100):
+            if self.section.updates:
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(len(snapshots[-1]), 1)
+        self.assertEqual(snapshots[-1][0]["cloud_path"], "/cloud/电影/B")
+
+    async def test_old_queue_fields_can_be_recovered(self) -> None:
+        worker = self.make_worker()
+        snapshot = pending("/Film").__dict__ | {"cloud_identity": "old-cloud"}
+        snapshot["cloud_path"], snapshot["plex_path"] = "/cloud/Film", "/plex/Film"
+        worker.load_queue([snapshot])
+        self.assertEqual(await worker.flush(force=True), 1)
+
+    async def test_full_queue_rejects_record_for_retry(self) -> None:
+        worker = self.make_worker(capacity=1)
+        self.assertTrue(await worker.submit_scan_directory("/cloud/A"))
+        self.assertFalse(await worker.submit_scan_directory("/cloud/B"))
+
+    async def test_failed_directory_does_not_block_other_scans(self) -> None:
+        worker = self.make_worker()
+        await worker.submit_scan_directory("/cloud/A")
+        await worker.submit_scan_directory("/cloud/B")
+        original_scan = worker.plex.scan
+
+        def scan(target):
+            if target.path.endswith("/A"):
+                raise RuntimeError("temporarily unavailable")
+            original_scan(target)
+
+        worker.plex.scan = scan
+        self.assertEqual(await worker.flush(force=True), 1)
+        self.assertEqual(self.section.updates, ["/plex/B"])
+        self.assertEqual(len(worker.coalescer.pending), 1)
+
+    async def test_invalid_or_over_capacity_recovered_queue_is_rejected(self) -> None:
+        worker = self.make_worker(capacity=1)
+        with self.assertRaises(ValueError):
+            worker.load_queue([pending("/A").__dict__, pending("/B").__dict__])
+        with self.assertRaises(ValueError):
+            worker.load_queue([{"cloud_path": "/cloud/A"}])
+
+    async def test_cancelled_persistence_finishes_before_next_snapshot(self) -> None:
+        worker = self.make_worker()
+        await worker.submit_scan_directory("/cloud/A")
+        started, release = threading.Event(), threading.Event()
+        snapshots = []
+
+        def save(values):
+            if not snapshots:
+                started.set()
+                release.wait(timeout=5)
+            snapshots.append(copy.deepcopy(values))
+
+        worker.persist_queue = save
+        flushing = asyncio.create_task(worker.flush(force=True))
+        self.assertTrue(await asyncio.to_thread(started.wait, 2))
+        flushing.cancel()
+        submitting = asyncio.create_task(worker.submit_scan_directory("/cloud/B"))
+        await asyncio.sleep(0)
+        self.assertFalse(flushing.done())
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await flushing
+        await submitting
         self.assertEqual(
-            section.updates,
-            ["/data/CloudNas/Guangya/Media/Video/已整理/电影/片名"],
+            {item["cloud_path"] for item in snapshots[-1]}, {"/cloud/A", "/cloud/B"}
         )
-        self.assertEqual(buffer_manager.prepared[0][0], "GuangYaPan|u")
-
-    def test_manual_directory_is_not_promoted_to_parent(self) -> None:
-        mapper = PathMapper(
-            watch_roots=["/光鸭云盘/Media/Video/已整理"],
-            mounts=[MountPoint("/CloudNAS/Guangya", "/光鸭云盘", is_mounted=True)],
-            plex_overrides=parse_override_lines(
-                "/CloudNAS/Guangya => /data/CloudNas/Guangya"
-            ),
-        )
-        section = FakeSection()
-        worker = EventWorker(
-            mapper,
-            PlexBridge(FakeService(FakePlex(section)), ["1"]),
-            FakeBufferManager(),
-            [CloudApi("GuangYaPan", "u", path="/光鸭云盘")],
-            debounce_seconds=30,
-            scans_per_second=1000,
-        )
-        directory = "/光鸭云盘/Media/Video/已整理/电影/片名"
-        self.assertTrue(worker.submit_scan_directory(directory))
-        self.assertEqual(asyncio.run(worker.flush(force=True)), 1)
-        self.assertEqual(
-            section.updates,
-            ["/data/CloudNas/Guangya/Media/Video/已整理/电影/片名"],
-        )
-
-    def test_ttd_only_direct_mapping_scans_without_cd2_topology_or_buffer(self) -> None:
-        mapper = PathMapper(
-            watch_roots=["/光鸭云盘/Media/Video/已整理"],
-            mounts=[],
-            plex_overrides=[],
-            cloud_plex_overrides=parse_override_lines(
-                "/光鸭云盘/Media/Video/已整理 => /data/CloudNas/Guangya"
-            ),
-        )
-        section = FakeSection()
-        section.locations = ["/data/CloudNas/Guangya"]
-        worker = EventWorker(
-            mapper,
-            PlexBridge(FakeService(FakePlex(section)), ["1"]),
-            None,
-            [],
-            debounce_seconds=30,
-            scans_per_second=1000,
-        )
-        directory = "/光鸭云盘/Media/Video/已整理/电影/片名"
-
-        self.assertTrue(worker.submit_scan_directory(directory, "ttd"))
-        self.assertEqual(asyncio.run(worker.flush(force=True)), 1)
-        self.assertEqual(section.updates, ["/data/CloudNas/Guangya/电影/片名"])

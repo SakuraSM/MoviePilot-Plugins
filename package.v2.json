@@ -1,14 +1,15 @@
 {
   "CloudDrivePlexSync": {
-    "name": "CloudDrive Plex 增量同步",
-    "description": "订阅 CloudDrive2 文件变化或独立轮询 TgToDrive 整理历史，并以低请求量触发 Plex 指定目录扫描。",
-    "labels": "CloudDrive2,TgToDrive,Plex,媒体库,增量扫描,网盘",
-    "version": "1.3.1",
+    "name": "TgToDrive Plex 增量同步",
+    "description": "通过 TgToDrive OpenAPI、持久化去重账本和历史对账触发 Plex 目录扫描，支持断点续跑与扫描队列恢复。",
+    "labels": "TgToDrive,OpenAPI,Plex,媒体库,增量扫描",
+    "version": "2.0.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png",
     "author": "community",
     "level": 1,
     "system_version": ">=2.12.0,<3",
     "history": {
+      "v2.0.0": "仅保留 TgToDrive OpenAPI → Plex；新增重叠回查、SQLite 去重账本、分批历史对账和执行中任务恢复，移除 CD2、Buffer、入库事件和旧 Cookie。",
       "v1.3.1": "支持关闭 CloudDrive2 联动，仅通过 TgToDrive 整理历史、直接路径映射和 Plex 局部扫描运行。",
       "v1.3.0": "新增 CD2 云端路径到 Plex 路径的直接映射并优先使用，未命中时兼容原有 MountPoint 推导；优化配置页响应式分区和窄屏布局。",
       "v1.2.0": "TTD 提交改为入队、跳过、重试三态，避免永久不匹配记录重复报警和阻塞游标；配置页改为五类标签页并新增跳过策略。",
