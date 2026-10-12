@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-import posixpath
 import time
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
@@ -13,15 +12,17 @@ from typing import TYPE_CHECKING, Any
 from .history_audit import HistoryAudit
 from .history_models import (
     TTDCursor,
-    TTDHistoryGapError,
+    TTDHistoryMode,
     TTDHistoryRecord,
     TTDPollStatus,
     TTDSubmitResult,
     TTDSubmitState,
 )
+from .history_policy import HistoryPolicy, resolve_directory
+from .history_reader import read_history
 from .history_store import HistoryStore
 from .models import PluginStats
-from .path_mapper import PathMappingError, is_under, normalize_path
+from .path_mapper import PathMappingError, normalize_path
 from .polling_loop import run_polling, wait_polling
 
 if TYPE_CHECKING:
@@ -49,6 +50,7 @@ class TTDHistoryPoller:
         overlap_pages: int = 2,
         store: HistoryStore | None = None,
         reconcile_hours: int = 6,
+        history_mode: TTDHistoryMode = TTDHistoryMode.NEW_ONLY,
     ) -> None:
         self.client = client
         self.submit_directory = submit_directory
@@ -57,11 +59,12 @@ class TTDHistoryPoller:
         self.max_pages = max(1, min(20, int(max_pages)))
         scope_value = f"{client.base_url}|{client.source}|{self.target_root}"
         self.cursor_scope = hashlib.sha256(scope_value.encode("utf-8")).hexdigest()
-        self.cursor = cursor or TTDCursor()
-        if self.cursor.scope and self.cursor.scope != self.cursor_scope:
-            self.cursor = TTDCursor(scope=self.cursor_scope)
-        else:
-            self.cursor.scope = self.cursor_scope
+        self.policy = HistoryPolicy.prepare(
+            mode=history_mode, cursor=cursor or TTDCursor(), scope=self.cursor_scope
+        )
+        self.cursor = self.policy.cursor
+        if history_mode == TTDHistoryMode.NEW_ONLY and store is None:
+            raise ValueError("仅新增模式需要持久化去重账本")
         self.persist_cursor = persist_cursor
         self.on_error = on_error
         self.on_skip = on_skip
@@ -72,6 +75,11 @@ class TTDHistoryPoller:
         self.status = TTDPollStatus(
             cursor_initialized=self.cursor.initialized,
             seen_records=len(self.cursor.seen_keys),
+            history_mode=history_mode.value,
+            baseline_at=self.cursor.baseline_at,
+            audit_next_page=self.cursor.audit_next_page,
+            audit_completed_at=self.cursor.audit_completed_at,
+            history_gap=self.cursor.history_gap,
         )
         self._wake_event = asyncio.Event()
         self._last_processing_error = ""
@@ -86,7 +94,7 @@ class TTDHistoryPoller:
                 save_cursor=self._save_cursor,
                 interval_hours=reconcile_hours,
             )
-            if store
+            if store and history_mode == TTDHistoryMode.INCLUDE_HISTORY
             else None
         )
 
@@ -95,8 +103,9 @@ class TTDHistoryPoller:
         return not bool(self.status.last_error)
 
     def request_reconcile(self) -> None:
-        if self.audit:
-            self.audit.request(restart=True)
+        if not self.audit:
+            raise ValueError("仅新增模式不处理历史，请先在配置中启用历史处理")
+        self.audit.request(restart=True)
         self.wake()
 
     @staticmethod
@@ -120,6 +129,7 @@ class TTDHistoryPoller:
         self.status.audit_next_page = self.cursor.audit_next_page
         self.status.audit_completed_at = self.cursor.audit_completed_at
         self.status.history_gap = self.cursor.history_gap
+        self.status.baseline_at = self.cursor.baseline_at
         self.status.cursor_initialized = self.cursor.initialized
         self.status.seen_records = len(self.cursor.seen_keys)
         if self.persist_cursor:
@@ -131,64 +141,21 @@ class TTDHistoryPoller:
             : self.seen_limit
         ]
 
-    def _cloud_directory(self, record: TTDHistoryRecord) -> str:
-        target = record.target_path.strip()
-        if target.startswith("/"):
-            cloud_path = normalize_path(target)
-        else:
-            cloud_path = normalize_path(posixpath.join(self.target_root, target))
-        if not is_under(cloud_path, self.target_root):
-            raise PathMappingError(f"TTD 目标路径越出配置根目录：{cloud_path}")
-        return cloud_path
-
     async def _fetch_new_records(self) -> list[TTDHistoryRecord]:
-        if not self.cursor.initialized:
-            first_page = await self.client.fetch_page(1)
-            return list(first_page.records)
-        known = set(self.cursor.seen_keys)
-        unseen: list[TTDHistoryRecord] = []
-        unseen_keys = set()
-        found_cursor = False
-        cursor_page = 0
-        exhausted = False
-        for page in range(1, self.max_pages + 1):
-            page_result = await self.client.fetch_page(page)
-            records = page_result.records
-            if not records:
-                exhausted = True
-                break
-            for record in records:
-                if record.key in known:
-                    found_cursor = True
-                    cursor_page = cursor_page or page
-                    if not self.store:
-                        continue
-                if record.key not in unseen_keys:
-                    unseen.append(record)
-                    unseen_keys.add(record.key)
-            if found_cursor and page >= cursor_page + self.overlap_pages:
-                break
-            if (
-                page_result.has_next is False
-                or page_result.item_count < self.client.page_size
-            ):
-                exhausted = True
-                break
-        if self.cursor.initialized and known and not found_cursor and not exhausted:
-            if not self.audit:
-                raise TTDHistoryGapError(
-                    f"连续 {self.max_pages} 页未找到已保存游标；已停止推进，"
-                    "请增大 TTD 最大补页数或手动确认历史缺口"
-                )
-            if not self.cursor.history_gap and self.on_error:
-                self.on_error("TTD 未找到历史游标，已启动分批历史对账")
-            self.audit.request(restart=not self.cursor.history_gap)
-            self.cursor.history_gap = True
-        return unseen
+        return await read_history(self)
 
     async def poll_once(self) -> int:
         self.status.last_poll_at = self.clock()
         records = await self._fetch_new_records()
+        self.status.connected = True
+        self.status.authenticated = True
+        self.status.last_success_at = self.clock()
+        self.status.last_error = ""
+        if self.policy.needs_baseline:
+            self.policy.establish_baseline(records, now=self.clock())
+            self._save_cursor()
+            return 0
+        records = await self.policy.select_records(records, store=self.store)
         if self.store:
             fetched = records
             records = await self.store.unseen(fetched)
@@ -196,10 +163,6 @@ class TTDHistoryPoller:
             self._remember(
                 record.key for record in fetched if record.key not in unseen_keys
             )
-        self.status.connected = True
-        self.status.authenticated = True
-        self.status.last_success_at = self.clock()
-        self.status.last_error = ""
 
         queued = await self._process_records(records)
         if self.audit:
@@ -216,7 +179,7 @@ class TTDHistoryPoller:
         # API is newest-first; enqueue oldest-first so Plex sees moves in order.
         for record in reversed(records):
             try:
-                cloud_directory = self._cloud_directory(record)
+                cloud_directory = resolve_directory(self.target_root, record)
                 outcome = submitted_directories.get(cloud_directory)
                 is_new_directory = outcome is None
                 if outcome is None:

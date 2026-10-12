@@ -10,11 +10,13 @@ from pathlib import Path
 from .configuration import PluginSettings
 from .event_worker import EventWorker
 from .history_models import TTDCursor, TTDSubmitResult
+from .history_policy import HistoryPolicy
 from .history_poller import TTDHistoryPoller
 from .history_store import HistoryStore
 from .models import PluginStats
 from .path_mapper import is_under
 from .plex_bridge import PlexBridge, PlexLibraryNotFoundError
+from .queue_policy import prepare_scan_queue
 from .ttd_client import TTDClient
 
 
@@ -49,6 +51,7 @@ class SyncRuntime:
         self.stop = asyncio.Event()
         self.ready = asyncio.Event()
         self.poller: TTDHistoryPoller | None = None
+        self.held_history_scans = 0
 
     async def submit_directory(self, path: str, source: str) -> TTDSubmitResult:
         if any(is_under(path, prefix) for prefix in self.settings.skip_paths):
@@ -69,12 +72,6 @@ class SyncRuntime:
 
     async def run(self) -> None:
         await asyncio.to_thread(self.plex.assert_supported)
-        pending = self.load("pending_scans") or []
-        if not isinstance(pending, list) or any(
-            not isinstance(item, dict) for item in pending
-        ):
-            raise ValueError("持久化扫描队列格式无效，已拒绝启动")
-        self.worker.load_queue(pending)
         client = TTDClient(
             self.settings.url,
             source=self.settings.source,
@@ -89,10 +86,19 @@ class SyncRuntime:
         store: HistoryStore | None = None
         tasks: list[asyncio.Task[None]] = []
         try:
-            store = await asyncio.to_thread(
-                HistoryStore, self.data_path / "history.sqlite3", scope
-            )
             cursor = TTDCursor.from_dict(self.load("ttd_cursor"))
+            policy = HistoryPolicy.prepare(
+                mode=self.settings.history_mode, cursor=cursor, scope=scope
+            )
+            store = await asyncio.to_thread(
+                HistoryStore, self.data_path / "history.sqlite3", policy.cursor.scope
+            )
+            self.held_history_scans = await prepare_scan_queue(
+                worker=self.worker,
+                policy=policy,
+                load=self.load,
+                save=self.save,
+            )
             self.poller = TTDHistoryPoller(
                 client,
                 self.submit_directory,
@@ -101,7 +107,8 @@ class SyncRuntime:
                 max_pages=self.settings.max_pages,
                 overlap_pages=self.settings.overlap_pages,
                 reconcile_hours=self.settings.reconcile_hours,
-                cursor=cursor,
+                cursor=policy.cursor,
+                history_mode=self.settings.history_mode,
                 store=store,
                 persist_cursor=lambda value: self.save("ttd_cursor", value),
                 on_error=self.on_error,
@@ -119,7 +126,8 @@ class SyncRuntime:
             for task in done:
                 if task is not stop_task:
                     task.result()
-                    raise RuntimeError("同步后台任务意外退出")
+                    if not self.stop.is_set():
+                        raise RuntimeError("同步后台任务意外退出")
         finally:
             self.ready.clear()
             for task in tasks:
@@ -137,6 +145,8 @@ class SyncRuntime:
             "ready": self.ready.is_set(),
             "pending_scans": len(self.worker.coalescer.pending),
             "inflight_scans": len(self.worker.inflight),
+            "history_mode": self.settings.history_mode.value,
+            "held_history_scans": self.held_history_scans,
             "last_scan_at": self.worker.last_scan_at,
             "last_error": self.worker.last_error
             or (self.poller.status.last_error if self.poller else ""),

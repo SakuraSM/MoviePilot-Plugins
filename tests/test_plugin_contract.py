@@ -67,7 +67,7 @@ class PluginContractTests(unittest.TestCase):
         module = load_plugin_module()
         plugin = module.CloudDrivePlexSync()
         form, defaults = plugin.get_form()
-        self.assertEqual(plugin.plugin_version, "2.0.1")
+        self.assertEqual(plugin.plugin_version, "2.1.0")
         for key in defaults:
             self.assertFalse(
                 any(
@@ -95,6 +95,11 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(set(models), set(defaults))
         self.assertEqual(models["ttd_api_token"]["type"], "password")
         self.assertEqual(defaults["ttd_unmatched_policy"], "retry")
+        self.assertEqual(defaults["ttd_history_mode"], "new_only")
+        self.assertEqual(
+            models["ttd_reconcile_hours"]["show"],
+            "{{ ttd_history_mode === 'include_history' }}",
+        )
         self.assertEqual(defaults["ttd_page_size"], 100)
         self.assertEqual(
             {item["path"] for item in plugin.get_api()},

@@ -18,7 +18,7 @@ MoviePilot 会读取仓库 `main` 分支的 `package.v2.json`，并将其中的�
 
 | 插件 ID | 名称 | 版本 | 说明 |
 |---|---|---:|---|
-| `CloudDrivePlexSync` | TgToDrive Plex 增量同步 | 2.0.1 | 通过 OpenAPI、持久化账本与历史对账触发 Plex 目录扫描，支持队列恢复 |
+| `CloudDrivePlexSync` | TgToDrive Plex 增量同步 | 2.1.0 | 默认仅处理新增整理记录，可选历史补扫，支持扫描日志与队列恢复 |
 
 详细配置见
 [`plugins.v2/clouddriveplexsync/README.md`](plugins.v2/clouddriveplexsync/README.md)。

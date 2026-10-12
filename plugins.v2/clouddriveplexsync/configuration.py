@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from .history_models import TTDHistoryMode
 from .history_parser import parse_ttd_skip_paths
 from .path_mapper import PathMapper, normalize_path, parse_override_lines
 from .ttd_client import normalize_ttd_api_token
@@ -22,6 +23,7 @@ DEFAULTS: dict[str, object] = {
     "plex_sections": "",
     "ttd_skip_paths": "",
     "ttd_unmatched_policy": "retry",
+    "ttd_history_mode": "new_only",
     "ttd_poll_seconds": 30,
     "ttd_page_size": 100,
     "ttd_max_pages": 5,
@@ -58,6 +60,7 @@ class PluginSettings:
     plex_sections: list[str]
     skip_paths: list[str]
     unmatched_policy: str
+    history_mode: TTDHistoryMode
     poll_seconds: int
     page_size: int
     max_pages: int
@@ -100,6 +103,9 @@ class PluginSettings:
             plex_sections=[str(item).strip() for item in sections if str(item).strip()],
             skip_paths=parse_ttd_skip_paths(config.get("ttd_skip_paths"), root),
             unmatched_policy=str(config.get("ttd_unmatched_policy") or "retry"),
+            history_mode=TTDHistoryMode(
+                str(config.get("ttd_history_mode") or TTDHistoryMode.NEW_ONLY.value)
+            ),
             poll_seconds=max(10, int(number(config, "ttd_poll_seconds"))),
             page_size=max(1, min(100, int(number(config, "ttd_page_size")))),
             max_pages=max(1, min(20, int(number(config, "ttd_max_pages")))),
@@ -166,6 +172,7 @@ def build_form(
         (
             "轮询与可靠性",
             (
+                ("ttd_history_mode", "整理记录处理范围"),
                 ("ttd_poll_seconds", "轮询间隔，秒"),
                 ("ttd_page_size", "每页记录数"),
                 ("ttd_max_pages", "快轮询最大页数"),
@@ -185,7 +192,7 @@ def build_form(
             "props": {
                 "type": "info",
                 "variant": "tonal",
-                "text": "在 TTD 实用工具 → OpenAPI 创建 Token。首次对账会补扫未登记的历史目录，队列按配置限速。",
+                "text": "默认仅处理首次查询建立基线后新出现的成功记录，启用前历史不处理。需要补历史时切换处理范围。Token 在 TTD 实用工具 → OpenAPI 中创建。",
             },
         }
     ]
@@ -212,6 +219,18 @@ def build_form(
                     {"title": "保留并重试", "value": "retry"},
                     {"title": "跳过并记账", "value": "skip"},
                 ]
+            if key == "ttd_history_mode":
+                component = "VSelect"
+                props["items"] = [
+                    {"title": "仅新增，历史记录不处理", "value": "new_only"},
+                    {"title": "新增及未处理历史", "value": "include_history"},
+                ]
+                props["hint"] = (
+                    "仅新增首次建立基线，普通重启沿用游标；历史模式会恢复保留的自动任务并分批补扫。"
+                )
+                props["persistent-hint"] = True
+            if key == "ttd_reconcile_hours":
+                props["show"] = "{{ ttd_history_mode === 'include_history' }}"
             children.append({"component": component, "props": props})
         content.append(
             {

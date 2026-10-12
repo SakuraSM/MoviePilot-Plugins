@@ -136,6 +136,9 @@ class EventWorker:
     def load_queue(self, values: Iterable[dict[str, object]]) -> None:
         self.coalescer.load(values)
 
+    async def persist_queue_state(self) -> None:
+        await self._save_queue()
+
     def _record_error(self, message: str) -> None:
         should_report = message != self.last_error
         self.last_error = message

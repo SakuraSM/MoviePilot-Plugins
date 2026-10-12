@@ -25,7 +25,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "TgToDrive Plex 增量同步"
     plugin_desc = "通过 TgToDrive 开放 API、历史对账和持久化队列触发 Plex 目录扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.1.0"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"
@@ -159,6 +159,9 @@ class CloudDrivePlexSync(_PluginBase):
                     "enabled": self._enabled,
                     "ready": False,
                     "last_error": self._last_error,
+                    "history_mode": self._settings.history_mode.value
+                    if self._settings
+                    else "new_only",
                 },
             }
         return self._call("status")
@@ -228,7 +231,12 @@ class CloudDrivePlexSync(_PluginBase):
         history = status.get("ttd") or {}
         if not isinstance(history, dict):
             history = {}
+        mode = status.get("history_mode") or (
+            self._settings.history_mode.value if self._settings else "new_only"
+        )
         text = (
+            f"模式：{'仅新增' if mode == 'new_only' else '新增及历史'}；"
+            f"已保留历史任务：{status.get('held_history_scans', 0)}；"
             f"就绪：{status.get('ready', False)}；待扫描：{status.get('pending_scans', 0)}；"
             f"执行中：{status.get('inflight_scans', 0)}；对账下一页：{history.get('audit_next_page', 0)}；"
             f"历史缺口：{history.get('history_gap', False)}；错误：{status.get('last_error') or '无'}"

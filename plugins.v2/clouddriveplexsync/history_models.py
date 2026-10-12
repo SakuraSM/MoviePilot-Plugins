@@ -24,6 +24,11 @@ class TTDHistoryGapError(TTDClientError):
     """The saved cursor was not found within the configured page budget."""
 
 
+class TTDHistoryMode(str, Enum):
+    NEW_ONLY = "new_only"
+    INCLUDE_HISTORY = "include_history"
+
+
 class TTDSubmitState(str, Enum):
     """Whether one TTD directory was accepted, permanently skipped, or should retry."""
 
@@ -88,9 +93,14 @@ class TTDCursor:
     audit_next_page: int = 1
     audit_completed_at: float = 0
     history_gap: bool = False
+    history_mode: TTDHistoryMode | None = None
+    mode_epoch: str = ""
+    baseline_at: float = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result["history_mode"] = self.history_mode.value if self.history_mode else None
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> TTDCursor:
@@ -106,6 +116,11 @@ class TTDCursor:
             audit_next_page=max(0, int(value.get("audit_next_page", 1))),
             audit_completed_at=float(value.get("audit_completed_at") or 0),
             history_gap=bool(value.get("history_gap")),
+            history_mode=TTDHistoryMode(value["history_mode"])
+            if value.get("history_mode")
+            else None,
+            mode_epoch=str(value.get("mode_epoch") or ""),
+            baseline_at=float(value.get("baseline_at") or 0),
         )
 
 
@@ -128,6 +143,8 @@ class TTDPollStatus:
     audit_next_page: int = 1
     audit_completed_at: float = 0
     history_gap: bool = False
+    history_mode: str = "new_only"
+    baseline_at: float = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

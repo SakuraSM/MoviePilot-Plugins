@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 import _bootstrap  # noqa: F401
-from clouddriveplexsync.history_models import TTDCursor, TTDSubmitResult
+from clouddriveplexsync.history_models import TTDCursor, TTDHistoryMode, TTDSubmitResult
 from clouddriveplexsync.history_poller import TTDHistoryPoller
 from clouddriveplexsync.history_store import HistoryStore
 from test_ttd_client import FakeHistoryClient, record
@@ -30,6 +30,7 @@ class HistoryReliabilityTests(unittest.IsolatedAsyncioTestCase):
             cursor=cursor or TTDCursor(initialized=True),
             store=self.store,
             **kwargs,
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
 
     async def test_late_success_behind_known_record_is_processed(self) -> None:
@@ -58,6 +59,7 @@ class HistoryReliabilityTests(unittest.IsolatedAsyncioTestCase):
             lambda path, _source: self.submitted.append(path) or True,
             "/cloud",
             cursor=TTDCursor(initialized=True, seen_keys=["id:3"]),
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
         await poller.poll_once()
         self.assertEqual(client.calls, [1, 2, 3])

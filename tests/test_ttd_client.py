@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import _bootstrap  # noqa: F401
+from clouddriveplexsync.history_models import TTDHistoryMode
 from clouddriveplexsync.ttd_client import (
     TTDAuthenticationError,
     TTDClient,
@@ -243,6 +244,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             lambda path, source: submitted.append((path, source)) or True,
             "/光鸭云盘/Media/Video/已整理",
             persist_cursor=persisted.append,
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
         self.assertEqual(await poller.poll_once(), 2)
         self.assertEqual(len(submitted), 2)
@@ -272,6 +274,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             submit,
             "/光鸭云盘/Media/Video/已整理",
             cursor=TTDCursor(initialized=True, seen_keys=["id:1"]),
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
         self.assertEqual(await poller.poll_once(), 1)
         self.assertEqual(
@@ -309,6 +312,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             cursor=TTDCursor(initialized=True, seen_keys=["id:1"]),
             on_skip=skipped.append,
             on_error=errors.append,
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
 
         self.assertEqual(await poller.poll_once(), 1)
@@ -335,6 +339,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             "/光鸭云盘/Media/Video/已整理",
             cursor=TTDCursor(initialized=True, seen_keys=["id:1"]),
             on_error=errors.append,
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
 
         self.assertEqual(await poller.poll_once(), 0)
@@ -365,6 +370,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             lambda path, source: submitted.append((path, source)) or True,
             "/光鸭云盘/Media/Video/已整理",
             cursor=TTDCursor(initialized=True, scope="old-scope", seen_keys=["id:1"]),
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
         self.assertEqual(await poller.poll_once(), 1)
         self.assertEqual(len(submitted), 1)
@@ -382,6 +388,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             "/光鸭云盘/Media/Video/已整理",
             max_pages=2,
             cursor=TTDCursor(initialized=True, seen_keys=["id:1"]),
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
         with self.assertRaises(TTDHistoryGapError):
             await poller.poll_once()
@@ -396,6 +403,7 @@ class TTDPollerTests(unittest.IsolatedAsyncioTestCase):
             "/光鸭云盘/Media/Video/已整理",
             cursor=TTDCursor(initialized=True, seen_keys=[]),
             on_skip=skipped.append,
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
         )
         self.assertEqual(await poller.poll_once(), 0)
         self.assertIn("parent path segments", skipped[0])

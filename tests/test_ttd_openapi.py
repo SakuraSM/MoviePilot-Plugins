@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import _bootstrap  # noqa: F401
+from clouddriveplexsync.history_models import TTDHistoryMode
 from clouddriveplexsync.models import PluginStats
 from clouddriveplexsync.ttd_client import (
     TTDAuthenticationError,
@@ -145,7 +146,12 @@ class TTDOpenAPITests(unittest.IsolatedAsyncioTestCase):
             client=transport,
         )
         root = "/光鸭云盘/Media/Video/已整理"
-        legacy_poller = TTDHistoryPoller(legacy, lambda *_args: True, root)
+        legacy_poller = TTDHistoryPoller(
+            legacy,
+            lambda *_args: True,
+            root,
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
+        )
         cursor = TTDCursor(
             initialized=True, scope=legacy_poller.cursor_scope, seen_keys=["id:42"]
         )
@@ -162,6 +168,7 @@ class TTDOpenAPITests(unittest.IsolatedAsyncioTestCase):
                 lambda path, source: submitted.append((path, source)) or True,
                 root,
                 cursor=cursor,
+                history_mode=TTDHistoryMode.INCLUDE_HISTORY,
             )
 
             self.assertEqual(await poller.poll_once(), 0)
