@@ -8,9 +8,10 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
 
-from .models import PendingScan, PluginStats
+from .models import PendingScan, PlexTarget, PluginStats
 from .path_mapper import PathMapper, PathMappingError, is_under
 from .plex_bridge import PlexBridge
+from .scan_logging import ScanStage, format_scan_log
 
 
 class ScanCoalescer:
@@ -71,6 +72,14 @@ class ScanCoalescer:
     def snapshot(self) -> list[dict[str, object]]:
         return [asdict(item) for item in self.pending.values()]
 
+    def covering_path(self, target: PlexTarget) -> str:
+        for item in self.pending.values():
+            if item.section_id == target.section_id and is_under(
+                target.path, item.plex_path
+            ):
+                return item.plex_path
+        raise RuntimeError("已接受的扫描任务未找到对应排队目录")
+
     def load(self, values: Iterable[dict[str, object]]) -> None:
         for value in values or []:
             if not self.add(PendingScan.from_dict(value)):
@@ -89,6 +98,7 @@ class EventWorker:
         stats: PluginStats | None = None,
         persist_queue: Callable[[list[dict[str, object]]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        on_info: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.mapper = mapper
@@ -98,6 +108,7 @@ class EventWorker:
         self.stats = stats
         self.persist_queue = persist_queue
         self.on_error = on_error
+        self.on_info = on_info
         self.clock = clock
         self.flush_signal = asyncio.Event()
         self.recent: deque[str] = deque(maxlen=100)
@@ -132,6 +143,11 @@ class EventWorker:
         if should_report and self.on_error:
             self.on_error(message)
 
+    def record_info(self, message: str) -> None:
+        self.recent.append(message)
+        if self.on_info:
+            self.on_info(message)
+
     async def submit_scan_directory(
         self, cloud_directory: str, source: str = "manual"
     ) -> bool:
@@ -154,8 +170,17 @@ class EventWorker:
         if not accepted:
             self._record_error("扫描队列已满，记录将保留并重试")
             return False
+        queued_path = self.coalescer.covering_path(target)
         await self._save_queue()
-        self.recent.append(f"QUEUE {source} {target.path}")
+        self.record_info(
+            format_scan_log(
+                stage=ScanStage.QUEUED,
+                cloud_path=path,
+                target=target,
+                sources=[source],
+                queued_path=queued_path,
+            )
+        )
         self.flush_signal.set()
         return True
 
@@ -182,7 +207,23 @@ class EventWorker:
                             raise PathMappingError(
                                 f"Plex 媒体库发生变化，保留任务：{item.plex_path}"
                             )
+                        self.record_info(
+                            format_scan_log(
+                                stage=ScanStage.STARTED,
+                                cloud_path=item.cloud_path,
+                                target=target,
+                                sources=item.sources,
+                            )
+                        )
                         await asyncio.to_thread(self.plex.scan, target)
+                        self.record_info(
+                            format_scan_log(
+                                stage=ScanStage.SUBMITTED,
+                                cloud_path=item.cloud_path,
+                                target=target,
+                                sources=item.sources,
+                            )
+                        )
                     except Exception as error:  # noqa: BLE001 - retain failed external Plex requests.
                         self._record_error(
                             f"扫描失败，保留任务：{item.plex_path}：{error}"
@@ -205,7 +246,6 @@ class EventWorker:
                     await self._save_queue()
                     scanned += 1
                     self.last_scan_at = self.clock()
-                    self.recent.append(f"SCAN {target.path}")
                     await asyncio.sleep(self.scan_interval)
                 if not self.coalescer.pending:
                     self.last_error = ""

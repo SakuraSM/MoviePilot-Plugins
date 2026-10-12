@@ -109,6 +109,26 @@ TTD 的 OpenAPI 凭据拥有后台管理员权限，请使用 HTTPS 并妥善保
 `401/403` 和登录重定向按 5、15、30、60 分钟退避；网络错误按 5、15、30、60 秒退避。
 恢复期间保留游标、账本和待扫描队列。
 
+## 扫描日志
+
+扫描日志同时写入 MoviePilot 运行日志和插件的“最近处理记录”，包含以下阶段：
+
+| 阶段 | 含义 |
+|---|---|
+| `QUEUE` | 目录已入队并完成队列持久化 |
+| `SCAN_START` | 已重新匹配 Plex 媒体库，准备调用局部刷新接口 |
+| `SCAN_SUBMITTED` | Plex 局部刷新请求已成功返回 |
+
+每条日志包含 `source`、`ttd_path`、`plex_path`、`section_id`、`section_title` 和
+`section_root`，分别表示来源、TTD 逻辑目录、Plex 容器目录、媒体库 ID、名称和命中的根目录。
+
+`QUEUE` 额外打印 `queued_plex_path`。子目录任务合并到已有父目录任务时，`plex_path`
+是本次请求的映射路径，`queued_plex_path` 是实际排队的父目录。
+`SCAN_START` 和 `SCAN_SUBMITTED` 使用执行时重新匹配的路径和媒体库信息，可能与入队时
+不同。字段使用 JSON 编码，目录名中的换行不会拆成多条日志。
+
+`SCAN_SUBMITTED` 表示请求提交成功，不表示 Plex 已完成媒体索引。
+
 ## 插件 API
 
 所有接口需要 MoviePilot Bearer 认证，插件 ID 仍为 `CloudDrivePlexSync`：

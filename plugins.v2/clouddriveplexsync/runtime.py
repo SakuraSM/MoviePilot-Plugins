@@ -28,6 +28,7 @@ class SyncRuntime:
         load: Callable[[str], object],
         save: Callable[[str, object], None],
         on_error: Callable[[str], None],
+        on_info: Callable[[str], None] | None = None,
     ) -> None:
         self.settings = settings
         self.stats = PluginStats()
@@ -41,6 +42,7 @@ class SyncRuntime:
             stats=self.stats,
             persist_queue=lambda values: save("pending_scans", values),
             on_error=on_error,
+            on_info=on_info,
         )
         self.data_path, self.load, self.save = data_path, load, save
         self.on_error = on_error
@@ -103,7 +105,7 @@ class SyncRuntime:
                 store=store,
                 persist_cursor=lambda value: self.save("ttd_cursor", value),
                 on_error=self.on_error,
-                on_skip=self.worker.recent.append,
+                on_skip=self.worker.record_info,
                 stats=self.stats,
             )
             tasks = [

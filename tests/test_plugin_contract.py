@@ -67,7 +67,7 @@ class PluginContractTests(unittest.TestCase):
         module = load_plugin_module()
         plugin = module.CloudDrivePlexSync()
         form, defaults = plugin.get_form()
-        self.assertEqual(plugin.plugin_version, "2.0.0")
+        self.assertEqual(plugin.plugin_version, "2.0.1")
         for key in defaults:
             self.assertFalse(
                 any(

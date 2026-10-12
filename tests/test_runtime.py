@@ -44,6 +44,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         saved, errors = {}, []
+        activity_logs = []
 
         def save(key, value):
             saved[key] = copy.deepcopy(value)
@@ -60,6 +61,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                     load=saved.get,
                     save=save,
                     on_error=errors.append,
+                    on_info=activity_logs.append,
                 )
                 with patch(
                     "clouddriveplexsync.runtime.TTDClient", side_effect=make_client
@@ -89,3 +91,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             transport.calls[0][1]["headers"]["authorization"], "Bearer test-token"
         )
         self.assertNotIn("cookie", transport.calls[0][1]["headers"])
+        self.assertTrue(any(message.startswith("QUEUE ") for message in activity_logs))
+        self.assertTrue(
+            any(message.startswith("SCAN_START ") for message in activity_logs)
+        )
+        self.assertTrue(
+            any(message.startswith("SCAN_SUBMITTED ") for message in activity_logs)
+        )
+        self.assertNotIn("test-token", "\n".join(activity_logs))
