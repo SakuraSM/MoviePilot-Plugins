@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import _bootstrap
+from clouddriveplexsync.configuration import PluginSettings
 
 
 def install_moviepilot_stubs() -> None:
@@ -22,6 +23,13 @@ def install_moviepilot_stubs() -> None:
 
         def get_data(self, key):
             return self._data.get(key)
+
+        def get_config(self):
+            return getattr(self, "_config", {})
+
+        def update_config(self, config):
+            self._config = config
+            return True
 
         def post_message(self, **_kwargs):
             return None
@@ -67,7 +75,7 @@ class PluginContractTests(unittest.TestCase):
         module = load_plugin_module()
         plugin = module.CloudDrivePlexSync()
         form, defaults = plugin.get_form()
-        self.assertEqual(plugin.plugin_version, "2.1.0")
+        self.assertEqual(plugin.plugin_version, "2.2.0")
         for key in defaults:
             self.assertFalse(
                 any(
@@ -95,17 +103,94 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(set(models), set(defaults))
         self.assertEqual(models["ttd_api_token"]["type"], "password")
         self.assertEqual(defaults["ttd_unmatched_policy"], "retry")
-        self.assertEqual(defaults["ttd_history_mode"], "new_only")
+        self.assertEqual(defaults["ttd_history_enabled"], False)
+        switch = next(
+            node
+            for group in form[0]["content"]
+            for node in group.get("content", [])
+            if node.get("props", {}).get("model") == "ttd_history_enabled"
+        )
+        self.assertEqual(switch["component"], "VSwitch")
         self.assertEqual(
             models["ttd_reconcile_hours"]["show"],
-            "{{ ttd_history_mode === 'include_history' }}",
+            "{{ ttd_history_enabled }}",
         )
         self.assertEqual(defaults["ttd_page_size"], 100)
         self.assertEqual(
             {item["path"] for item in plugin.get_api()},
-            {"/status", "/test", "/flush", "/resync", "/reconcile"},
+            {
+                "/status",
+                "/test",
+                "/flush",
+                "/resync",
+                "/resync/plex",
+                "/reconcile",
+                "/history/start",
+                "/history/stop",
+            },
         )
         self.assertTrue(all(item["auth"] == "bear" for item in plugin.get_api()))
+        for item in plugin.get_api():
+            if item["path"].startswith("/history/"):
+                self.assertEqual(item["methods"], ["POST"])
+
+    def test_explicit_false_overrides_legacy_history_mode(self) -> None:
+        self.assertTrue(
+            PluginSettings.from_config(
+                {"ttd_history_mode": "include_history"}
+            ).history_enabled
+        )
+        for enabled in (True, False):
+            settings = PluginSettings.from_config(
+                {
+                    "ttd_history_mode": "include_history",
+                    "ttd_history_enabled": enabled,
+                }
+            )
+            self.assertIs(settings.history_enabled, enabled)
+
+    def test_live_history_control_persists_boolean_and_removes_legacy_key(self) -> None:
+        plugin = load_plugin_module().CloudDrivePlexSync()
+        plugin._config = {
+            "ttd_history_mode": "include_history",
+            "ttd_url": "https://ttd.example",
+        }
+        plugin._settings = PluginSettings.from_config(plugin._config)
+        plugin._persist_history_enabled(False)
+        self.assertIs(plugin._config["ttd_history_enabled"], False)
+        self.assertNotIn("ttd_history_mode", plugin._config)
+        self.assertEqual(plugin._config["ttd_url"], "https://ttd.example")
+        self.assertFalse(plugin._settings.history_enabled)
+        with (
+            patch.object(plugin, "update_config", return_value=False),
+            self.assertRaises(OSError),
+        ):
+            plugin._persist_history_enabled(True)
+        self.assertFalse(plugin._settings.history_enabled)
+
+    def test_detail_page_has_native_immediate_start_stop_actions(self) -> None:
+        plugin = load_plugin_module().CloudDrivePlexSync()
+        status = {
+            "success": True,
+            "data": {
+                "ready": True,
+                "history_processing": {"enabled": True, "running": True},
+            },
+        }
+        with patch.object(plugin, "api_status", return_value=status):
+            buttons = [
+                node for node in plugin.get_page() if node["component"] == "VBtn"
+            ]
+        self.assertEqual(len(buttons), 2)
+        self.assertTrue(buttons[0]["props"]["disabled"])
+        self.assertFalse(buttons[1]["props"]["disabled"])
+        self.assertEqual(
+            buttons[1]["events"]["click"],
+            {
+                "api": "/plugin/CloudDrivePlexSync/history/stop",
+                "method": "POST",
+            },
+        )
 
     def test_cookie_only_configuration_requires_api_token(self) -> None:
         plugin = load_plugin_module().CloudDrivePlexSync()

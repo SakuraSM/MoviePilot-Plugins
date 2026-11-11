@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 from .history_audit import HistoryAudit
@@ -51,6 +51,10 @@ class TTDHistoryPoller:
         store: HistoryStore | None = None,
         reconcile_hours: int = 6,
         history_mode: TTDHistoryMode = TTDHistoryMode.NEW_ONLY,
+        submit_records: Callable[
+            [str, list[TTDHistoryRecord]], Awaitable[TTDSubmitResult]
+        ]
+        | None = None,
     ) -> None:
         self.client = client
         self.submit_directory = submit_directory
@@ -83,6 +87,7 @@ class TTDHistoryPoller:
         )
         self._wake_event = asyncio.Event()
         self._last_processing_error = ""
+        self.submit_records = submit_records
 
         self.store = store
         self.audit = (
@@ -144,6 +149,16 @@ class TTDHistoryPoller:
     async def _fetch_new_records(self) -> list[TTDHistoryRecord]:
         return await read_history(self)
 
+    async def _submit_one(
+        self, path: str, records: list[TTDHistoryRecord]
+    ) -> TTDSubmitResult:
+        if self.submit_records:
+            return await self.submit_records(path, records)
+        result = self.submit_directory(path, "ttd")
+        if inspect.isawaitable(result):
+            result = await result
+        return self._submission_result(result)
+
     async def poll_once(self) -> int:
         self.status.last_poll_at = self.clock()
         records = await self._fetch_new_records()
@@ -158,7 +173,10 @@ class TTDHistoryPoller:
         records = await self.policy.select_records(records, store=self.store)
         if self.store:
             fetched = records
-            records = await self.store.unseen(fetched)
+            records = await self.store.unseen(
+                fetched,
+                include_historical_only=self.policy.mode == TTDHistoryMode.NEW_ONLY,
+            )
             unseen_keys = {record.key for record in records}
             self._remember(
                 record.key for record in fetched if record.key not in unseen_keys
@@ -174,6 +192,14 @@ class TTDHistoryPoller:
     ) -> int:
         processed: list[str] = []
         submitted_directories: dict[str, TTDSubmitResult] = {}
+        grouped_records: dict[str, list[TTDHistoryRecord]] = {}
+        if self.submit_records:
+            for item in records:
+                try:
+                    directory = resolve_directory(self.target_root, item)
+                except PathMappingError:
+                    continue
+                grouped_records.setdefault(directory, []).append(item)
         queued = 0
         retrying = False
         # API is newest-first; enqueue oldest-first so Plex sees moves in order.
@@ -183,10 +209,9 @@ class TTDHistoryPoller:
                 outcome = submitted_directories.get(cloud_directory)
                 is_new_directory = outcome is None
                 if outcome is None:
-                    result = self.submit_directory(cloud_directory, "ttd")
-                    if inspect.isawaitable(result):
-                        result = await result
-                    outcome = self._submission_result(result)
+                    outcome = await self._submit_one(
+                        cloud_directory, grouped_records.get(cloud_directory, [record])
+                    )
                     submitted_directories[cloud_directory] = outcome
                 if outcome.state == TTDSubmitState.RETRY:
                     message = f"TTD 整理记录暂未处理，将重试：{cloud_directory}" + (
@@ -236,7 +261,8 @@ class TTDHistoryPoller:
         if self.store and processed:
             accepted = set(processed)
             await self.store.remember(
-                [record for record in records if record.key in accepted]
+                [record for record in records if record.key in accepted],
+                historical=self.policy.mode == TTDHistoryMode.INCLUDE_HISTORY,
             )
         if update_cursor and (processed or not self.cursor.initialized):
             self.cursor.initialized = True

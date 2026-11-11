@@ -30,25 +30,46 @@ class HistoryStore:
                 "scope TEXT NOT NULL, epoch TEXT NOT NULL, record_key TEXT NOT NULL, "
                 "PRIMARY KEY(scope, epoch, record_key))"
             )
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS historical_only ("
+                "scope TEXT NOT NULL, record_key TEXT NOT NULL, revision TEXT NOT NULL, "
+                "PRIMARY KEY(scope, record_key, revision))"
+            )
 
-    async def unseen(self, records: list[TTDHistoryRecord]) -> list[TTDHistoryRecord]:
-        return await asyncio.to_thread(self._unseen, records)
+    async def unseen(
+        self, records: list[TTDHistoryRecord], *, include_historical_only: bool = False
+    ) -> list[TTDHistoryRecord]:
+        return await asyncio.to_thread(self._unseen, records, include_historical_only)
 
-    def _unseen(self, records: list[TTDHistoryRecord]) -> list[TTDHistoryRecord]:
+    def _unseen(
+        self, records: list[TTDHistoryRecord], include_historical_only: bool
+    ) -> list[TTDHistoryRecord]:
         unseen = []
         with self._lock, self._connection:
             for record in records:
-                rows = self._connection.execute(
-                    "SELECT revision FROM processed WHERE scope=? AND record_key=? "
+                key = (self.scope, record.key, record.revision)
+                processed = self._connection.execute(
+                    "SELECT 1 FROM processed WHERE scope=? AND record_key=? "
                     "AND revision=?",
-                    (self.scope, record.key, record.revision),
-                ).fetchall()
-                if not rows:
+                    key,
+                ).fetchone()
+                historical_only = (
+                    processed
+                    and include_historical_only
+                    and self._connection.execute(
+                        "SELECT 1 FROM historical_only WHERE scope=? AND record_key=? "
+                        "AND revision=?",
+                        key,
+                    ).fetchone()
+                )
+                if not processed or historical_only:
                     unseen.append(record)
         return unseen
 
-    async def remember(self, records: list[TTDHistoryRecord]) -> None:
-        await asyncio.to_thread(self._remember, records)
+    async def remember(
+        self, records: list[TTDHistoryRecord], *, historical: bool = False
+    ) -> None:
+        await asyncio.to_thread(self._remember, records, historical)
 
     async def known_keys(
         self, records: list[TTDHistoryRecord], *, epoch: str
@@ -76,12 +97,25 @@ class HistoryStore:
                 [(self.scope, epoch, record.key) for record in records],
             )
 
-    def _remember(self, records: list[TTDHistoryRecord]) -> None:
+    def _remember(self, records: list[TTDHistoryRecord], historical: bool) -> None:
+        entries = [(self.scope, record.key, record.revision) for record in records]
         with self._lock, self._connection:
+            if historical:
+                self._connection.executemany(
+                    "INSERT OR IGNORE INTO historical_only "
+                    "SELECT ?, ?, ? WHERE NOT EXISTS ("
+                    "SELECT 1 FROM processed WHERE scope=? AND record_key=? AND revision=?)",
+                    [entry + entry for entry in entries],
+                )
             self._connection.executemany(
                 "INSERT OR IGNORE INTO processed VALUES (?, ?, ?)",
-                [(self.scope, record.key, record.revision) for record in records],
+                entries,
             )
+            if not historical:
+                self._connection.executemany(
+                    "DELETE FROM historical_only WHERE scope=? AND record_key=? AND revision=?",
+                    entries,
+                )
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close)

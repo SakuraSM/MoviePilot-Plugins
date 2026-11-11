@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+TTD_MAX_PAGE_SIZE = 100
+
 
 class TTDClientError(RuntimeError):
     """Base class for safe-to-display TgToDrive client failures."""
@@ -67,6 +69,11 @@ class TTDHistoryRecord:
     completed_at: str = ""
     source: str = ""
     record_id: str = ""
+    file_name: str = ""
+    title: str = ""
+    media_type: str = ""
+    season_num: int | None = None
+    episode_num: int | None = None
 
     @property
     def revision(self) -> str:

@@ -5,85 +5,26 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import asdict
 
-from .models import PendingScan, PlexTarget, PluginStats
-from .path_mapper import PathMapper, PathMappingError, is_under
-from .plex_bridge import PlexBridge
+from .activity_log import ActivityEntry
+from .history_jobs import hold_pending_history, is_history_only, restore_held_history
+from .history_models import TTDHistoryRecord
+from .media_hints import build_media_hint, current_media_hints
+from .models import (
+    HISTORY_SOURCE,
+    MediaHint,
+    PendingScan,
+    PlexTarget,
+    PluginStats,
+)
+from .path_mapper import PathMapper, PathMappingError
+from .plex_bridge import PlexBridge, PlexLibraryNotFoundError
+from .queue_storage import persist_values
 from .scan_logging import ScanStage, format_scan_log
-
-
-class ScanCoalescer:
-    """Bounded directory queue without common-ancestor promotion."""
-
-    def __init__(self, debounce_seconds: int = 30, capacity: int = 10_000) -> None:
-        self.debounce_seconds = max(0, int(debounce_seconds))
-        self.capacity = max(1, int(capacity))
-        self.pending: dict[str, PendingScan] = {}
-
-    @staticmethod
-    def _key(section_id: str, plex_path: str) -> str:
-        return f"{section_id}\0{plex_path}"
-
-    def add(self, item: PendingScan) -> bool:
-        exact_key = self._key(item.section_id, item.plex_path)
-        existing = self.pending.get(exact_key)
-        if existing:
-            existing.last_seen = max(existing.last_seen, item.last_seen)
-            existing.sources = sorted(set(existing.sources).union(item.sources))
-            return True
-
-        # Suppress a new child when an explicit ancestor scan is already queued.
-        for queued in self.pending.values():
-            if queued.section_id == item.section_id and is_under(
-                item.plex_path, queued.plex_path
-            ):
-                queued.last_seen = max(queued.last_seen, item.last_seen)
-                queued.sources = sorted(set(queued.sources).union(item.sources))
-                return True
-
-        # An explicitly queued ancestor supersedes its existing descendants.
-        descendant_keys = [
-            key
-            for key, queued in self.pending.items()
-            if queued.section_id == item.section_id
-            and queued.plex_path != item.plex_path
-            and is_under(queued.plex_path, item.plex_path)
-        ]
-        for key in descendant_keys:
-            self.pending.pop(key, None)
-
-        if len(self.pending) >= self.capacity:
-            return False
-        self.pending[exact_key] = item
-        return True
-
-    def due(self, now: float | None = None, force: bool = False) -> list[PendingScan]:
-        now = time.time() if now is None else now
-        keys = [
-            key
-            for key, item in self.pending.items()
-            if force or now - item.last_seen >= self.debounce_seconds
-        ]
-        items = [self.pending.pop(key) for key in keys]
-        return sorted(items, key=lambda item: (item.first_seen, item.plex_path))
-
-    def snapshot(self) -> list[dict[str, object]]:
-        return [asdict(item) for item in self.pending.values()]
-
-    def covering_path(self, target: PlexTarget) -> str:
-        for item in self.pending.values():
-            if item.section_id == target.section_id and is_under(
-                target.path, item.plex_path
-            ):
-                return item.plex_path
-        raise RuntimeError("已接受的扫描任务未找到对应排队目录")
-
-    def load(self, values: Iterable[dict[str, object]]) -> None:
-        for value in values or []:
-            if not self.add(PendingScan.from_dict(value)):
-                raise ValueError("持久化扫描队列超过配置容量，请增大容量后重试")
+from .scan_queue import ScanCoalescer
+from .scan_submission import enqueue_target
 
 
 class EventWorker:
@@ -99,6 +40,7 @@ class EventWorker:
         persist_queue: Callable[[list[dict[str, object]]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         on_info: Callable[[str], None] | None = None,
+        persist_held: Callable[[list[dict[str, object]]], None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.mapper = mapper
@@ -109,29 +51,57 @@ class EventWorker:
         self.persist_queue = persist_queue
         self.on_error = on_error
         self.on_info = on_info
+        self.persist_held = persist_held
+        self.history_enabled = False
+        self.held_history: dict[str, PendingScan] = {}
+        self._flush_task: asyncio.Task[int] | None = None
+        self._active_item: PendingScan | None = None
+        self._history_pausing = False
         self.clock = clock
         self.flush_signal = asyncio.Event()
         self.recent: deque[str] = deque(maxlen=100)
         self.inflight: dict[str, PendingScan] = {}
         self._flush_lock = asyncio.Lock()
         self._persistence_lock = asyncio.Lock()
+        self.on_activity: Callable[[ActivityEntry], None] | None = None
+        self.on_submitted: (
+            Callable[[PlexTarget, list[MediaHint]], Awaitable[None]] | None
+        ) = None
         self.last_scan_at = 0.0
         self.last_error = ""
 
     async def _save_queue(self) -> None:
         async with self._persistence_lock:
-            if self.persist_queue:
-                snapshot = [
-                    asdict(item) for item in self.inflight.values()
-                ] + self.coalescer.snapshot()
-                saving = asyncio.create_task(
-                    asyncio.to_thread(self.persist_queue, snapshot)
-                )
-                try:
-                    await asyncio.shield(saving)
-                except asyncio.CancelledError:
-                    await saving
-                    raise
+            await persist_values(self.persist_queue, self.queue_snapshot())
+
+    def queue_snapshot(self) -> list[dict[str, object]]:
+        return [
+            asdict(item) for item in self.inflight.values()
+        ] + self.coalescer.snapshot()
+
+    def load_held_history(self, values: Iterable[dict[str, object]]) -> None:
+        for value in values:
+            item = PendingScan.from_dict(value)
+            item.sources = [HISTORY_SOURCE]
+            self.held_history[self.coalescer.key_for(item)] = item
+
+    async def pause_history(self) -> int:
+        self.history_enabled = False
+        self._history_pausing = True
+        try:
+            if (
+                self._flush_task
+                and self._active_item
+                and is_history_only(self._active_item)
+            ):
+                self._flush_task.cancel()
+                await asyncio.gather(self._flush_task, return_exceptions=True)
+            return await hold_pending_history(self)
+        finally:
+            self._history_pausing = False
+
+    async def restore_history(self) -> int:
+        return await restore_held_history(self)
 
     def load_queue(self, values: Iterable[dict[str, object]]) -> None:
         self.coalescer.load(values)
@@ -143,126 +113,174 @@ class EventWorker:
         should_report = message != self.last_error
         self.last_error = message
         self.recent.append(f"ERROR {message}")
+        if self.on_activity and should_report:
+            self.on_activity(ActivityEntry(self.clock(), "error", message))
         if should_report and self.on_error:
             self.on_error(message)
 
     def record_info(self, message: str) -> None:
         self.recent.append(message)
+        if self.on_activity:
+            self.on_activity(ActivityEntry(self.clock(), "info", message))
         if self.on_info:
             self.on_info(message)
 
+    def record_external_error(self, message: str) -> None:
+        self.recent.append(f"ERROR {message}")
+        if self.on_activity:
+            self.on_activity(ActivityEntry(self.clock(), "error", message))
+
     async def submit_scan_directory(
-        self, cloud_directory: str, source: str = "manual"
+        self,
+        cloud_directory: str,
+        source: str = "manual",
+        *,
+        records: Sequence[TTDHistoryRecord] = (),
     ) -> bool:
+        if source == HISTORY_SOURCE and not self.history_enabled:
+            return False
         path = self.mapper.validate_cloud_path(cloud_directory)
         target = await asyncio.to_thread(
             self.plex.find_target, self.mapper.cloud_to_plex(path)
         )
-        now = self.clock()
-        accepted = self.coalescer.add(
-            PendingScan(
-                cloud_path=path,
-                plex_path=target.path,
-                section_id=target.section_id,
-                section_title=target.section_title,
-                first_seen=now,
-                last_seen=now,
-                sources=[source],
-            )
-        )
-        if not accepted:
-            self._record_error("扫描队列已满，记录将保留并重试")
+        if source == HISTORY_SOURCE and not self.history_enabled:
             return False
-        queued_path = self.coalescer.covering_path(target)
-        await self._save_queue()
-        self.record_info(
-            format_scan_log(
-                stage=ScanStage.QUEUED,
-                cloud_path=path,
-                target=target,
-                sources=[source],
-                queued_path=queued_path,
+        media = list(
+            dict.fromkeys(
+                hint
+                for record in records
+                if (hint := build_media_hint(self, path, target.path, record))
             )
         )
-        self.flush_signal.set()
-        return True
+        return await enqueue_target(
+            self, target, cloud_path=path, source=source, path_kind="cloud", media=media
+        )
+
+    async def submit_plex_scan_directory(self, plex_directory: str) -> bool:
+        path = plex_directory.strip().replace("\\", "/")
+        if not path.startswith("/"):
+            raise PathMappingError("请输入 Plex 容器中的绝对目录路径")
+        try:
+            target = await asyncio.to_thread(self.plex.find_target, path)
+        except PlexLibraryNotFoundError as error:
+            raise PlexLibraryNotFoundError(
+                f"目录不属于所选 Plex 媒体库：{path}"
+            ) from error
+        return await enqueue_target(
+            self, target, cloud_path="", source="manual", path_kind="plex"
+        )
 
     async def flush(self, force: bool = False) -> int:
         async with self._flush_lock:
-            items = self.coalescer.due(self.clock(), force=force)
-            if not items:
-                return 0
-            for item in items:
-                item.state = "inflight"
-                self.inflight[self.coalescer._key(item.section_id, item.plex_path)] = (
-                    item
-                )
-            scanned = 0
+            self._flush_task = asyncio.create_task(self._flush(force))
             try:
-                await self._save_queue()
-                for item in items:
-                    try:
-                        target = await asyncio.to_thread(
-                            self.plex.find_target,
-                            self.mapper.cloud_to_plex(item.cloud_path),
-                        )
-                        if target.section_id != item.section_id:
-                            raise PathMappingError(
-                                f"Plex 媒体库发生变化，保留任务：{item.plex_path}"
-                            )
-                        self.record_info(
-                            format_scan_log(
-                                stage=ScanStage.STARTED,
-                                cloud_path=item.cloud_path,
-                                target=target,
-                                sources=item.sources,
-                            )
-                        )
-                        await asyncio.to_thread(self.plex.scan, target)
-                        self.record_info(
-                            format_scan_log(
-                                stage=ScanStage.SUBMITTED,
-                                cloud_path=item.cloud_path,
-                                target=target,
-                                sources=item.sources,
-                            )
-                        )
-                    except Exception as error:  # noqa: BLE001 - retain failed external Plex requests.
-                        self._record_error(
-                            f"扫描失败，保留任务：{item.plex_path}：{error}"
-                        )
-                        item.state = "queued"
-                        item.last_seen = self.clock()
-                        if not self.coalescer.add(item):
-                            self.coalescer.pending[
-                                self.coalescer._key(item.section_id, item.plex_path)
-                            ] = item
-                        self.inflight.pop(
-                            self.coalescer._key(item.section_id, item.plex_path)
-                        )
-                        await self._save_queue()
-                        await asyncio.sleep(self.scan_interval)
-                        continue
-                    self.inflight.pop(
-                        self.coalescer._key(item.section_id, item.plex_path)
-                    )
-                    await self._save_queue()
-                    scanned += 1
-                    self.last_scan_at = self.clock()
-                    await asyncio.sleep(self.scan_interval)
-                if not self.coalescer.pending:
-                    self.last_error = ""
-                return scanned
+                return await self._flush_task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if self._history_pausing and current and not current.cancelling():
+                    return 0
+                raise
             finally:
-                for item in self.inflight.values():
+                self._flush_task = None
+
+    async def _flush(self, force: bool) -> int:
+        items = self.coalescer.due(self.clock(), force=force)
+        paused = [
+            item for item in items if is_history_only(item) and not self.history_enabled
+        ]
+        items = [
+            item
+            for item in items
+            if not (is_history_only(item) and not self.history_enabled)
+        ]
+        for item in paused:
+            self.coalescer.add(item)
+        if not items:
+            return 0
+        for item in items:
+            item.state = "inflight"
+            self.inflight[self.coalescer.key_for(item)] = item
+        scanned = 0
+        try:
+            await self._save_queue()
+            for item in items:
+                if self.inflight.get(self.coalescer.key_for(item)) is not item:
+                    continue
+                self._active_item = item
+                try:
+                    if is_history_only(item) and not self.history_enabled:
+                        continue
+                    plex_path = (
+                        item.plex_path
+                        if item.path_kind == "plex"
+                        else self.mapper.cloud_to_plex(item.cloud_path)
+                    )
+                    target = await asyncio.to_thread(self.plex.find_target, plex_path)
+                    if is_history_only(item) and not self.history_enabled:
+                        continue
+                    if self.inflight.get(self.coalescer.key_for(item)) is not item:
+                        continue
+                    if target.section_id != item.section_id:
+                        raise PathMappingError(
+                            f"Plex 媒体库发生变化，保留任务：{item.plex_path}"
+                        )
+                    self.record_info(
+                        format_scan_log(
+                            stage=ScanStage.STARTED,
+                            cloud_path=item.cloud_path,
+                            target=target,
+                            sources=item.sources,
+                        )
+                    )
+                    await asyncio.to_thread(self.plex.scan, target)
+                    self.record_info(
+                        format_scan_log(
+                            stage=ScanStage.SUBMITTED,
+                            cloud_path=item.cloud_path,
+                            target=target,
+                            sources=item.sources,
+                        )
+                    )
+                    if self.on_submitted and item.media:
+                        try:
+                            await self.on_submitted(
+                                target, current_media_hints(self, item, target)
+                            )
+                        except Exception as error:  # noqa: BLE001 - a logging failure must not repeat a Plex scan.
+                            self._record_error(
+                                f"扫描已提交，但入库核验任务保存失败：{error}"
+                            )
+                except Exception as error:  # noqa: BLE001 - retain failed external Plex requests.
+                    self._record_error(f"扫描失败，保留任务：{item.plex_path}：{error}")
                     item.state = "queued"
                     item.last_seen = self.clock()
+                    item.ready_at = None
                     if not self.coalescer.add(item):
-                        self.coalescer.pending[
-                            self.coalescer._key(item.section_id, item.plex_path)
-                        ] = item
-                self.inflight.clear()
+                        self.coalescer.pending[self.coalescer.key_for(item)] = item
+                    self.inflight.pop(self.coalescer.key_for(item))
+                    await self._save_queue()
+                    await asyncio.sleep(self.scan_interval)
+                    continue
+                finally:
+                    self._active_item = None
+                self.inflight.pop(self.coalescer.key_for(item))
                 await self._save_queue()
+                scanned += 1
+                self.last_scan_at = self.clock()
+                await asyncio.sleep(self.scan_interval)
+            if not self.coalescer.pending:
+                self.last_error = ""
+            return scanned
+        finally:
+            self._active_item = None
+            for item in self.inflight.values():
+                item.state = "queued"
+                item.last_seen = self.clock()
+                item.ready_at = None
+                if not self.coalescer.add(item):
+                    self.coalescer.pending[self.coalescer.key_for(item)] = item
+            self.inflight.clear()
+            await self._save_queue()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():

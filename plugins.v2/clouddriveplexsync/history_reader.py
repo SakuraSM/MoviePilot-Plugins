@@ -4,10 +4,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .history_models import TTDHistoryGapError, TTDHistoryMode, TTDHistoryRecord
+from .history_models import (
+    TTD_MAX_PAGE_SIZE,
+    TTDHistoryGapError,
+    TTDHistoryMode,
+    TTDHistoryRecord,
+)
 
 if TYPE_CHECKING:
     from .history_poller import TTDHistoryPoller
+
+GAP_RECOVERY_MAX_PAGES = 20
 
 
 async def read_history(poller: TTDHistoryPoller) -> list[TTDHistoryRecord]:
@@ -20,8 +27,20 @@ async def read_history(poller: TTDHistoryPoller) -> list[TTDHistoryRecord]:
     found_cursor = False
     cursor_page = 0
     exhausted = False
-    for page in range(1, poller.max_pages + 1):
-        page_result = await poller.client.fetch_page(page)
+    is_new_only = poller.policy.mode == TTDHistoryMode.NEW_ONLY
+    is_gap_recovery = is_new_only and poller.cursor.history_gap
+    page_size = TTD_MAX_PAGE_SIZE if is_gap_recovery else poller.client.page_size
+    page_budget = (
+        max(poller.max_pages, GAP_RECOVERY_MAX_PAGES)
+        if is_gap_recovery
+        else poller.max_pages
+    )
+    for page in range(1, page_budget + 1):
+        page_result = (
+            await poller.client.fetch_page(page, page_size=page_size)
+            if is_gap_recovery
+            else await poller.client.fetch_page(page)
+        )
         records = page_result.records
         if not records:
             exhausted = True
@@ -37,13 +56,9 @@ async def read_history(poller: TTDHistoryPoller) -> list[TTDHistoryRecord]:
                 unseen_keys.add(record.key)
         if found_cursor and page >= cursor_page + poller.overlap_pages:
             break
-        if (
-            page_result.has_next is False
-            or page_result.item_count < poller.client.page_size
-        ):
+        if page_result.has_next is False or page_result.item_count < page_size:
             exhausted = True
             break
-    is_new_only = poller.policy.mode == TTDHistoryMode.NEW_ONLY
     if (
         poller.cursor.initialized
         and not found_cursor
@@ -54,8 +69,12 @@ async def read_history(poller: TTDHistoryPoller) -> list[TTDHistoryRecord]:
             poller.cursor.history_gap = True
             poller._save_cursor()
             raise TTDHistoryGapError(
-                f"连续 {poller.max_pages} 页未找到已保存游标；已停止推进，"
-                "请增大 TTD 最大补页数或手动确认历史缺口"
+                f"连续 {page} 页未找到已保存游标；已停止推进，"
+                + (
+                    f"扩大至最多 {page_budget * page_size} 条后仍未找到，请确认缺口或记录是否被清理"
+                    if is_gap_recovery
+                    else "下次将自动扩大范围查找"
+                )
             )
         if not poller.cursor.history_gap and poller.on_error:
             poller.on_error("TTD 未找到历史游标，已启动分批历史对账")

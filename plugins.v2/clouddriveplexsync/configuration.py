@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from .history_models import TTDHistoryMode
 from .history_parser import parse_ttd_skip_paths
+from .manual_scan_ui import manual_scan_card
 from .path_mapper import PathMapper, normalize_path, parse_override_lines
 from .ttd_client import normalize_ttd_api_token
 
@@ -23,7 +24,7 @@ DEFAULTS: dict[str, object] = {
     "plex_sections": "",
     "ttd_skip_paths": "",
     "ttd_unmatched_policy": "retry",
-    "ttd_history_mode": "new_only",
+    "ttd_history_enabled": False,
     "ttd_poll_seconds": 30,
     "ttd_page_size": 100,
     "ttd_max_pages": 5,
@@ -34,6 +35,7 @@ DEFAULTS: dict[str, object] = {
     "scans_per_second": 1,
     "verify_tls": True,
     "notify_errors": True,
+    "manual_plex_path": "",
 }
 
 
@@ -60,7 +62,7 @@ class PluginSettings:
     plex_sections: list[str]
     skip_paths: list[str]
     unmatched_policy: str
-    history_mode: TTDHistoryMode
+    history_enabled: bool
     poll_seconds: int
     page_size: int
     max_pages: int
@@ -71,6 +73,14 @@ class PluginSettings:
     scans_per_second: float
     verify_tls: bool
     notify_errors: bool
+
+    @property
+    def history_mode(self) -> TTDHistoryMode:
+        return (
+            TTDHistoryMode.INCLUDE_HISTORY
+            if self.history_enabled
+            else TTDHistoryMode.NEW_ONLY
+        )
 
     @classmethod
     def from_config(cls, config: dict[str, object]) -> PluginSettings:
@@ -103,8 +113,11 @@ class PluginSettings:
             plex_sections=[str(item).strip() for item in sections if str(item).strip()],
             skip_paths=parse_ttd_skip_paths(config.get("ttd_skip_paths"), root),
             unmatched_policy=str(config.get("ttd_unmatched_policy") or "retry"),
-            history_mode=TTDHistoryMode(
-                str(config.get("ttd_history_mode") or TTDHistoryMode.NEW_ONLY.value)
+            history_enabled=(
+                bool(config["ttd_history_enabled"])
+                if "ttd_history_enabled" in config
+                else config.get("ttd_history_mode")
+                == TTDHistoryMode.INCLUDE_HISTORY.value
             ),
             poll_seconds=max(10, int(number(config, "ttd_poll_seconds"))),
             page_size=max(1, min(100, int(number(config, "ttd_page_size")))),
@@ -172,7 +185,7 @@ def build_form(
         (
             "轮询与可靠性",
             (
-                ("ttd_history_mode", "整理记录处理范围"),
+                ("ttd_history_enabled", "启用历史整理记录查询与扫描"),
                 ("ttd_poll_seconds", "轮询间隔，秒"),
                 ("ttd_page_size", "每页记录数"),
                 ("ttd_max_pages", "快轮询最大页数"),
@@ -192,7 +205,7 @@ def build_form(
             "props": {
                 "type": "info",
                 "variant": "tonal",
-                "text": "默认仅处理首次查询建立基线后新出现的成功记录，启用前历史不处理。需要补历史时切换处理范围。Token 在 TTD 实用工具 → OpenAPI 中创建。",
+                "text": "默认只处理新增记录。历史开关支持明确开启或关闭，也可在详情页随时停止或继续历史处理。已发给 Plex 的扫描请求无法撤回。Token 在 TTD 实用工具 → OpenAPI 中创建。",
             },
         }
     ]
@@ -219,18 +232,13 @@ def build_form(
                     {"title": "保留并重试", "value": "retry"},
                     {"title": "跳过并记账", "value": "skip"},
                 ]
-            if key == "ttd_history_mode":
-                component = "VSelect"
-                props["items"] = [
-                    {"title": "仅新增，历史记录不处理", "value": "new_only"},
-                    {"title": "新增及未处理历史", "value": "include_history"},
-                ]
+            if key == "ttd_history_enabled":
                 props["hint"] = (
-                    "仅新增首次建立基线，普通重启沿用游标；历史模式会恢复保留的自动任务并分批补扫。"
+                    "关闭即停止历史分页查询和后续扫描提交，保留断点与任务；开启后继续处理。新增监听不受影响。"
                 )
                 props["persistent-hint"] = True
             if key == "ttd_reconcile_hours":
-                props["show"] = "{{ ttd_history_mode === 'include_history' }}"
+                props["show"] = "{{ ttd_history_enabled }}"
             children.append({"component": component, "props": props})
         content.append(
             {
@@ -239,4 +247,5 @@ def build_form(
                 "content": children,
             }
         )
+    content.append(manual_scan_card())
     return [{"component": "VForm", "content": content}], dict(DEFAULTS)

@@ -4,20 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 
+from .activity_log import ActivityJournal
 from .configuration import PluginSettings
+from .content_verifier import ContentVerifier
 from .event_worker import EventWorker
-from .history_models import TTDCursor, TTDSubmitResult
+from .history_control import HistoryControl
+from .history_models import TTDCursor, TTDHistoryMode, TTDHistoryRecord, TTDSubmitResult
 from .history_policy import HistoryPolicy
 from .history_poller import TTDHistoryPoller
 from .history_store import HistoryStore
-from .models import PluginStats
+from .models import HISTORY_SOURCE, MediaHint, PlexTarget, PluginStats
 from .path_mapper import is_under
 from .plex_bridge import PlexBridge, PlexLibraryNotFoundError
-from .queue_policy import prepare_scan_queue
+from .queue_policy import HELD_HISTORY_KEY, prepare_scan_queue, read_queue
+from .runtime_status import build_runtime_status
 from .ttd_client import TTDClient
+from .verification_store import MediaVerification
 
 
 class SyncRuntime:
@@ -31,6 +38,7 @@ class SyncRuntime:
         save: Callable[[str, object], None],
         on_error: Callable[[str], None],
         on_info: Callable[[str], None] | None = None,
+        persist_history_enabled: Callable[[bool], None] | None = None,
     ) -> None:
         self.settings = settings
         self.stats = PluginStats()
@@ -43,6 +51,7 @@ class SyncRuntime:
             scans_per_second=settings.scans_per_second,
             stats=self.stats,
             persist_queue=lambda values: save("pending_scans", values),
+            persist_held=lambda values: save(HELD_HISTORY_KEY, values),
             on_error=on_error,
             on_info=on_info,
         )
@@ -51,13 +60,85 @@ class SyncRuntime:
         self.stop = asyncio.Event()
         self.ready = asyncio.Event()
         self.poller: TTDHistoryPoller | None = None
-        self.held_history_scans = 0
+        self.history: HistoryControl | None = None
+        self.persist_history_enabled = persist_history_enabled
+        self.activity: ActivityJournal | None = None
+        self.verifier: ContentVerifier | None = None
+        self.activity_error = ""
 
-    async def submit_directory(self, path: str, source: str) -> TTDSubmitResult:
+    def _report_ttd_error(self, message: str) -> None:
+        self.worker.record_external_error(message)
+        self.on_error(message)
+
+    def _report_activity_error(self, message: str) -> None:
+        self.activity_error = message
+        self.on_error(message)
+
+    async def _track_submitted(
+        self, target: PlexTarget, media: list[MediaHint]
+    ) -> None:
+        if self.activity:
+            await self.activity.add_submitted(target, media, time.time())
+
+    def _record_indexed(self, entry: MediaVerification) -> None:
+        self.worker.record_info(
+            "PLEX_INDEXED "
+            + json.dumps(
+                {
+                    "title": entry.title,
+                    "season": entry.season_num,
+                    "episode": entry.episode_num,
+                    "plex_path": entry.expected_path,
+                    "section_title": entry.section_title,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    async def set_history_enabled(self, enabled: bool) -> dict[str, object]:
+        if not self.history:
+            raise RuntimeError("历史处理后台尚未就绪")
+        await self.history.set_enabled(enabled)
+        return self.history.status()
+
+    async def _submit_history(self, path: str, _source: str) -> TTDSubmitResult:
+        return await self.submit_directory(path, HISTORY_SOURCE)
+
+    def _build_history(
+        self, client: TTDClient, store: HistoryStore, legacy: TTDCursor
+    ) -> HistoryControl:
+        saved = self.load("ttd_audit_cursor")
+        cursor = TTDCursor.from_dict(saved)
+        if saved is None and legacy.history_mode == TTDHistoryMode.INCLUDE_HISTORY:
+            cursor = TTDCursor.from_dict(legacy.to_dict())
+        poller = TTDHistoryPoller(
+            client,
+            self._submit_history,
+            self.settings.mapper.target_root,
+            poll_seconds=self.settings.poll_seconds,
+            reconcile_hours=self.settings.reconcile_hours,
+            cursor=cursor,
+            history_mode=TTDHistoryMode.INCLUDE_HISTORY,
+            store=store,
+            persist_cursor=lambda value: self.save("ttd_audit_cursor", value),
+            on_error=self._report_ttd_error,
+            on_skip=self.worker.record_info,
+            stats=self.stats,
+            submit_records=lambda path, records: self.submit_directory(
+                path, HISTORY_SOURCE, records=records
+            ),
+        )
+        return HistoryControl(poller, self.worker, self.persist_history_enabled)
+
+    async def submit_directory(
+        self, path: str, source: str, *, records: list[TTDHistoryRecord] | None = None
+    ) -> TTDSubmitResult:
         if any(is_under(path, prefix) for prefix in self.settings.skip_paths):
             return TTDSubmitResult.skipped("命中配置的跳过路径")
         try:
-            accepted = await self.worker.submit_scan_directory(path, source)
+            accepted = await self.worker.submit_scan_directory(
+                path, source, records=records or ()
+            )
             return (
                 TTDSubmitResult.queued()
                 if accepted
@@ -86,14 +167,31 @@ class SyncRuntime:
         store: HistoryStore | None = None
         tasks: list[asyncio.Task[None]] = []
         try:
+            try:
+                self.activity = await ActivityJournal.open(
+                    self.data_path / "activity.sqlite3",
+                    on_error=self._report_activity_error,
+                )
+                self.worker.on_activity = self.activity.append
+                self.worker.on_submitted = self._track_submitted
+                self.verifier = ContentVerifier(
+                    self.plex,
+                    self.activity,
+                    on_indexed=self._record_indexed,
+                    on_error=self._report_ttd_error,
+                )
+            except Exception as error:  # noqa: BLE001 - log storage must not prevent scans.
+                self.activity_error = f"日志与入库核验不可用：{type(error).__name__}"
+                self.on_error(self.activity_error)
             cursor = TTDCursor.from_dict(self.load("ttd_cursor"))
+            legacy = TTDCursor.from_dict(cursor.to_dict())
             policy = HistoryPolicy.prepare(
-                mode=self.settings.history_mode, cursor=cursor, scope=scope
+                mode=TTDHistoryMode.NEW_ONLY, cursor=cursor, scope=scope
             )
             store = await asyncio.to_thread(
                 HistoryStore, self.data_path / "history.sqlite3", policy.cursor.scope
             )
-            self.held_history_scans = await prepare_scan_queue(
+            await prepare_scan_queue(
                 worker=self.worker,
                 policy=policy,
                 load=self.load,
@@ -108,17 +206,25 @@ class SyncRuntime:
                 overlap_pages=self.settings.overlap_pages,
                 reconcile_hours=self.settings.reconcile_hours,
                 cursor=policy.cursor,
-                history_mode=self.settings.history_mode,
+                history_mode=TTDHistoryMode.NEW_ONLY,
                 store=store,
                 persist_cursor=lambda value: self.save("ttd_cursor", value),
-                on_error=self.on_error,
+                on_error=self._report_ttd_error,
                 on_skip=self.worker.record_info,
                 stats=self.stats,
+                submit_records=lambda path, records: self.submit_directory(
+                    path, "ttd", records=records
+                ),
             )
+            self.worker.load_held_history(await read_queue(self.load, HELD_HISTORY_KEY))
+            self.history = self._build_history(client, store, legacy)
+            await self.history.set_enabled(self.settings.history_enabled, persist=False)
             tasks = [
                 asyncio.create_task(self.worker.run(self.stop)),
                 asyncio.create_task(self.poller.run(self.stop)),
             ]
+            if self.verifier:
+                tasks.append(asyncio.create_task(self.verifier.run(self.stop)))
             stop_task = asyncio.create_task(self._wait_stop())
             tasks.append(stop_task)
             self.ready.set()
@@ -130,9 +236,15 @@ class SyncRuntime:
                         raise RuntimeError("同步后台任务意外退出")
         finally:
             self.ready.clear()
+            if self.history:
+                await self.history.close()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self.worker.on_activity = None
+            self.worker.on_submitted = None
+            if self.activity:
+                await self.activity.close()
             await client.close()
             if store:
                 await store.close()
@@ -141,17 +253,4 @@ class SyncRuntime:
         await self.stop.wait()
 
     async def status(self) -> dict[str, object]:
-        return {
-            "ready": self.ready.is_set(),
-            "pending_scans": len(self.worker.coalescer.pending),
-            "inflight_scans": len(self.worker.inflight),
-            "history_mode": self.settings.history_mode.value,
-            "held_history_scans": self.held_history_scans,
-            "last_scan_at": self.worker.last_scan_at,
-            "last_error": self.worker.last_error
-            or (self.poller.status.last_error if self.poller else ""),
-            "recent": list(self.worker.recent),
-            "stats": self.stats.to_dict(),
-            "ttd": self.poller.status.to_dict() if self.poller else {},
-            "plex": await asyncio.to_thread(self.plex.describe),
-        }
+        return await build_runtime_status(self)

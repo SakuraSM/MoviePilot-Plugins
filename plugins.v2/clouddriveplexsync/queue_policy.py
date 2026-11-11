@@ -9,11 +9,11 @@ from dataclasses import asdict
 from .event_worker import EventWorker
 from .history_models import TTDHistoryMode
 from .history_policy import HistoryPolicy
-from .models import PendingScan
+from .models import HISTORY_SOURCE, PendingScan
 
 PENDING_QUEUE_KEY = "pending_scans"
 HELD_HISTORY_KEY = "held_history_scans"
-AUTOMATIC_SOURCES = frozenset({"ttd"})
+AUTOMATIC_SOURCES = frozenset({"ttd", HISTORY_SOURCE})
 
 
 async def read_queue(

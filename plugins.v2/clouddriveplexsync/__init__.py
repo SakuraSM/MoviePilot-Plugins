@@ -5,18 +5,25 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Coroutine
+from dataclasses import replace
 
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from pydantic import BaseModel
 
+from .activity_log import read_offline_activity
 from .configuration import PluginSettings, build_form
+from .control_ui import build_page
 from .runtime import SyncRuntime
 
 
 class ResyncRequest(BaseModel):
     cloud_path: str
+
+
+class PlexResyncRequest(BaseModel):
+    plex_path: str
 
 
 class CloudDrivePlexSync(_PluginBase):
@@ -25,7 +32,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "TgToDrive Plex 增量同步"
     plugin_desc = "通过 TgToDrive 开放 API、历史对账和持久化队列触发 Plex 目录扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"
@@ -100,8 +107,18 @@ class CloudDrivePlexSync(_PluginBase):
             save=self.save_data,
             on_error=self._set_error,
             on_info=self._record_info,
+            persist_history_enabled=self._persist_history_enabled,
         )
         await self._runtime.run()
+
+    def _persist_history_enabled(self, enabled: bool) -> None:
+        config = dict(self.get_config() or {})
+        config["ttd_history_enabled"] = enabled
+        config.pop("ttd_history_mode", None)
+        if self.update_config(config) is False:
+            raise OSError("历史开关保存失败，历史处理保持停止，请重试")
+        if self._settings:
+            self._settings = replace(self._settings, history_enabled=enabled)
 
     @staticmethod
     def _record_info(message: str) -> None:
@@ -137,8 +154,19 @@ class CloudDrivePlexSync(_PluginBase):
             return {"success": True, "scans": await runtime.worker.flush(force=True)}
         if action == "resync":
             return {"success": await runtime.worker.submit_scan_directory(path)}
-        if action == "reconcile" and runtime.poller:
-            runtime.poller.request_reconcile()
+        if action == "resync_plex":
+            accepted = await runtime.worker.submit_plex_scan_directory(path)
+            return {
+                "success": accepted,
+                "message": "已加入扫描队列，Plex 索引可能需要一些时间"
+                if accepted
+                else "扫描队列已满，请稍后重试",
+            }
+        if action in {"history_start", "history_stop"}:
+            state = await runtime.set_history_enabled(action == "history_start")
+            return {"success": True, "data": state}
+        if action == "reconcile" and runtime.history:
+            await runtime.history.reconcile()
             return {"success": True, "message": "已请求分批历史对账"}
         if action == "test" and runtime.poller:
             await runtime.poller.client.fetch_page(1)
@@ -175,41 +203,32 @@ class CloudDrivePlexSync(_PluginBase):
     def api_resync(self, request: ResyncRequest) -> object:
         return self._call("resync", request.cloud_path)
 
+    def api_resync_plex(self, request: PlexResyncRequest) -> object:
+        return self._call("resync_plex", request.plex_path)
+
     def api_reconcile(self) -> object:
         return self._call("reconcile")
 
+    def api_history_start(self) -> object:
+        return self._call("history_start")
+
+    def api_history_stop(self) -> object:
+        return self._call("history_stop")
+
     def get_api(self) -> list[dict[str, object]]:
+        endpoints = [
+            ("/history/start", self.api_history_start, "POST"),
+            ("/history/stop", self.api_history_stop, "POST"),
+            ("/status", self.api_status, "GET"),
+            ("/test", self.api_test, "POST"),
+            ("/flush", self.api_flush, "POST"),
+            ("/resync", self.api_resync, "POST"),
+            ("/resync/plex", self.api_resync_plex, "POST"),
+            ("/reconcile", self.api_reconcile, "POST"),
+        ]
         return [
-            {
-                "path": "/status",
-                "endpoint": self.api_status,
-                "methods": ["GET"],
-                "auth": "bear",
-            },
-            {
-                "path": "/test",
-                "endpoint": self.api_test,
-                "methods": ["POST"],
-                "auth": "bear",
-            },
-            {
-                "path": "/flush",
-                "endpoint": self.api_flush,
-                "methods": ["POST"],
-                "auth": "bear",
-            },
-            {
-                "path": "/resync",
-                "endpoint": self.api_resync,
-                "methods": ["POST"],
-                "auth": "bear",
-            },
-            {
-                "path": "/reconcile",
-                "endpoint": self.api_reconcile,
-                "methods": ["POST"],
-                "auth": "bear",
-            },
+            {"path": path, "endpoint": endpoint, "methods": [method], "auth": "bear"}
+            for path, endpoint, method in endpoints
         ]
 
     @staticmethod
@@ -221,37 +240,26 @@ class CloudDrivePlexSync(_PluginBase):
             {"title": value.name, "value": value.name}
             for value in MediaServerHelper().get_configs().values()
         ]
-        return build_form(servers)
+        form, defaults = build_form(servers)
+        if self._settings:
+            defaults["ttd_history_enabled"] = self._settings.history_enabled
+        return form, defaults
 
     def get_page(self) -> list[dict[str, object]]:
         response = self.api_status()
         status = response.get("data", {}) if isinstance(response, dict) else {}
         if not isinstance(status, dict):
             status = {}
-        history = status.get("ttd") or {}
-        if not isinstance(history, dict):
-            history = {}
-        mode = status.get("history_mode") or (
-            self._settings.history_mode.value if self._settings else "new_only"
+        if not status.get("ready"):
+            try:
+                status.update(
+                    read_offline_activity(self.get_data_path() / "activity.sqlite3")
+                )
+            except Exception as error:  # noqa: BLE001 - preserve the status page if storage is unavailable.
+                status["activity_error"] = f"读取日志失败：{type(error).__name__}"
+        return build_page(
+            status, bool(self._settings and self._settings.history_enabled)
         )
-        text = (
-            f"模式：{'仅新增' if mode == 'new_only' else '新增及历史'}；"
-            f"已保留历史任务：{status.get('held_history_scans', 0)}；"
-            f"就绪：{status.get('ready', False)}；待扫描：{status.get('pending_scans', 0)}；"
-            f"执行中：{status.get('inflight_scans', 0)}；对账下一页：{history.get('audit_next_page', 0)}；"
-            f"历史缺口：{history.get('history_gap', False)}；错误：{status.get('last_error') or '无'}"
-        )
-        return [
-            {"component": "VAlert", "props": {"type": "info", "text": text}},
-            {
-                "component": "VTextarea",
-                "props": {
-                    "label": "最近处理记录",
-                    "readonly": True,
-                    "modelValue": "\n".join(status.get("recent") or []),
-                },
-            },
-        ]
 
     def stop_service(self) -> None:
         self._enabled = False

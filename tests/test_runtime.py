@@ -110,7 +110,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.sleep(0.001)
                     self.assertTrue(runtime.poller.cursor.initialized)
                     self.assertEqual(section.updates, [])
-                    self.assertEqual(runtime.held_history_scans, 1)
+                    self.assertEqual(len(runtime.worker.held_history), 1)
                     self.assertIsNone(runtime.poller.audit)
                     self.assertEqual(len(saved["held_history_scans"]), 1)
                     transport.response._payload["records"].insert(
@@ -183,14 +183,25 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                     try:
                         for _ in range(500):
                             if (
-                                runtime.poller
-                                and runtime.poller.cursor.audit_next_page == 0
-                                and (run_index or section.updates)
+                                runtime.ready.is_set()
+                                and runtime.history
+                                and runtime.history.poller.cursor.audit_next_page == 0
+                                and (
+                                    run_index
+                                    or (
+                                        section.updates
+                                        and not runtime.worker.inflight
+                                        and not runtime.worker.coalescer.pending
+                                        and saved.get("pending_scans") == []
+                                    )
+                                )
                             ):
                                 break
                             await asyncio.sleep(0.001)
                         self.assertTrue(runtime.ready.is_set())
-                        self.assertEqual(runtime.poller.cursor.audit_next_page, 0)
+                        self.assertEqual(
+                            runtime.history.poller.cursor.audit_next_page, 0
+                        )
                         self.assertEqual(section.updates, ["/plex/Movies/Film"])
                         self.assertNotIn("test-token", str(await runtime.status()))
                     finally:

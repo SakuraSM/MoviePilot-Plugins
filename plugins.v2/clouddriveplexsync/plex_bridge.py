@@ -26,6 +26,13 @@ def parse_plex_version(value: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def normalize_plex_path(path: str, platform: str) -> str:
+    normalized = normalize_path(path)
+    if platform.casefold() == "linux" and normalized.startswith("//"):
+        return "/" + normalized.lstrip("/")
+    return normalized
+
+
 class PlexBridge:
     """Wrap a MoviePilot Plex service instance with strict path checks."""
 
@@ -86,14 +93,15 @@ class PlexBridge:
         }
 
     def find_target(self, path: str) -> PlexTarget:
-        path = normalize_path(path)
+        platform = str(getattr(self.plex, "platform", "") or "")
+        path = normalize_plex_path(path, platform)
         candidates: list[tuple[int, str, str, str, Any]] = []
         for section in self.sections():
             section_id = str(getattr(section, "key", ""))
             if self.allowed_sections and section_id not in self.allowed_sections:
                 continue
             for raw_location in getattr(section, "locations", None) or []:
-                location = normalize_path(str(raw_location))
+                location = normalize_plex_path(str(raw_location), platform)
                 if is_under(path, location):
                     candidates.append(
                         (

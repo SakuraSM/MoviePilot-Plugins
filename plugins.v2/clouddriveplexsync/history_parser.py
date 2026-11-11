@@ -161,6 +161,14 @@ def _find_items(value: Any) -> list[dict[str, Any]] | None:
     return None
 
 
+def _optional_number(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def parse_history_payload(payload: Any) -> list[TTDHistoryRecord]:
     """Parse known TgToDrive response shapes without depending on one release."""
 
@@ -190,6 +198,19 @@ def parse_history_payload(payload: Any) -> list[TTDHistoryRecord]:
                 status=status,
                 completed_at=completed_at,
                 source=str(_first_value(item, _SOURCE_FIELDS) or "").strip(),
+                file_name=str(
+                    _first_value(item, ("file_name", "filename", "fileName")) or ""
+                ).strip(),
+                title=str(_first_value(item, ("title", "media_title")) or "").strip(),
+                media_type=str(
+                    _first_value(item, ("media_type", "mediaType")) or ""
+                ).strip(),
+                season_num=_optional_number(
+                    _first_value(item, ("season_num", "seasonNumber", "season"))
+                ),
+                episode_num=_optional_number(
+                    _first_value(item, ("episode_num", "episodeNumber", "episode"))
+                ),
             )
         )
     return records

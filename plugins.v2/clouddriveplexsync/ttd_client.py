@@ -12,6 +12,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from .history_models import (
+    TTD_MAX_PAGE_SIZE,
     TTDAuthenticationError,
     TTDClientError,
     TTDCursor,
@@ -88,7 +89,7 @@ class TTDClient:
             ).rstrip("/")
             self.endpoint_url = f"{self.base_url}/api/organize-history"
         self.source = str(source or "").strip()
-        self.page_size = max(1, min(100, int(page_size)))
+        self.page_size = max(1, min(TTD_MAX_PAGE_SIZE, int(page_size)))
         self.timeout = max(1.0, float(timeout))
         self.stats = stats
         self._owns_client = client is None
@@ -96,7 +97,9 @@ class TTDClient:
             verify=verify, follow_redirects=False
         )
 
-    async def fetch_page(self, page: int) -> TTDHistoryPage:
+    async def fetch_page(
+        self, page: int, *, page_size: int | None = None
+    ) -> TTDHistoryPage:
         if self.stats:
             self.stats.ttd_poll_requests += 1
         headers = {
@@ -108,7 +111,9 @@ class TTDClient:
             params={
                 "source": self.source,
                 "page": max(1, int(page)),
-                "limit": self.page_size,
+                "limit": self.page_size
+                if page_size is None
+                else max(1, min(TTD_MAX_PAGE_SIZE, int(page_size))),
                 "status": "success",
             },
             headers=headers,

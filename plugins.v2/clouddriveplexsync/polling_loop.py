@@ -14,14 +14,17 @@ if TYPE_CHECKING:
 async def run_polling(poller: TTDHistoryPoller, stop_event: asyncio.Event) -> None:
     transient_steps = (5.0, 15.0, 30.0, 60.0)
     auth_steps = (300.0, 900.0, 1800.0, 3600.0)
+    gap_steps = (60.0, 300.0, 900.0, 1800.0, 3600.0)
     transient_index = 0
     auth_index = 0
+    gap_index = 0
     while not stop_event.is_set():
         delay = float(poller.poll_seconds)
         try:
             await poller.poll_once()
             transient_index = 0
             auth_index = 0
+            gap_index = 0
         except asyncio.CancelledError:
             raise
         except TTDAuthenticationError as exc:
@@ -40,20 +43,28 @@ async def run_polling(poller: TTDHistoryPoller, stop_event: asyncio.Event) -> No
             poller.status.last_error = str(exc)
             if poller.stats:
                 poller.stats.ttd_errors += 1
-            delay = max(float(poller.poll_seconds), 60.0)
+            if isinstance(exc, TTDHistoryGapError):
+                delay = max(float(poller.poll_seconds), gap_steps[gap_index])
+                gap_index = min(gap_index + 1, len(gap_steps) - 1)
+            else:
+                delay = max(float(poller.poll_seconds), 60.0)
             if should_report and poller.on_error:
                 poller.on_error(f"TTD 轮询暂停推进：{exc}")
         except Exception as exc:  # noqa: BLE001 - network errors use transient backoff.
-            should_report = poller.status.last_error != str(exc)
+            detail = str(exc).strip() or type(exc).__name__
+            should_report = poller.status.last_error != detail
             poller.status.connected = False
             poller.status.authenticated = False
-            poller.status.last_error = str(exc)
+            poller.status.last_error = detail
             if poller.stats:
                 poller.stats.ttd_errors += 1
             delay = transient_steps[transient_index]
             transient_index = min(transient_index + 1, len(transient_steps) - 1)
+            if poller.cursor.history_gap:
+                delay = max(delay, gap_steps[gap_index])
+                gap_index = min(gap_index + 1, len(gap_steps) - 1)
             if should_report and poller.on_error:
-                poller.on_error(f"TTD 轮询失败：{exc}")
+                poller.on_error(f"TTD 轮询失败：{detail}")
         await poller._wait(stop_event, delay)
     poller.status.next_poll_at = 0
 
