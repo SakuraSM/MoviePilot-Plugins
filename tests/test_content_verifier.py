@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
 import _bootstrap  # noqa: F401
-from clouddriveplexsync.activity_log import ActivityJournal
+from clouddriveplexsync.activity_log import ActivityJournal, read_offline_activity
 from clouddriveplexsync.content_verifier import ContentVerifier
 from clouddriveplexsync.models import MediaHint, PlexTarget
 from clouddriveplexsync.plex_bridge import PlexBridge
@@ -177,3 +179,52 @@ class ContentVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await self.journal.indexed())[0].expected_path, hint.expected_path
         )
+
+    async def test_other_version_is_resolved_separately_from_the_original(self) -> None:
+        hint = media_hint()
+        await self.journal.add_submitted(self.target, [hint], 100.0)
+        entry = await self.journal.next_due(115.0)
+        alternate = "/plex/节目/Season 1/节目.S01E02.1080p.mkv"
+        await self.journal.mark_alternative(entry.id, 115.0, alternate)
+        await self.journal.defer(entry, 116.0, "过期的重试")
+        self.assertEqual(await self.journal.pending_count(), 0)
+        self.assertEqual(await self.journal.indexed(), [])
+        self.assertIsNone(await self.journal.next_due(1000.0))
+        result = (await self.journal.alternatives())[0]
+        self.assertEqual(result.expected_path, hint.expected_path)
+        self.assertEqual(result.matched_path, alternate)
+        self.assertIsNone(result.confirmed_at)
+        self.assertEqual(result.resolved_at, 115.0)
+        await self.journal.close()
+        self.journal = await ActivityJournal.open(
+            Path(self.directory.name) / "activity.sqlite3"
+        )
+        self.assertEqual((await self.journal.alternatives())[0].matched_path, alternate)
+
+    async def test_legacy_verifications_are_migrated_without_losing_records(
+        self,
+    ) -> None:
+        await self.journal.close()
+        path = Path(self.directory.name) / "activity.sqlite3"
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("DROP TABLE media_verification")
+            db.execute(
+                "CREATE TABLE media_verification (id INTEGER PRIMARY KEY, record_key TEXT, revision TEXT, "
+                "section_id TEXT, section_title TEXT, expected_path TEXT, title TEXT, media_type TEXT, "
+                "season_num INTEGER, episode_num INTEGER, submitted_at REAL, confirmed_at REAL, "
+                "next_check_at REAL, attempts INTEGER, detail TEXT)"
+            )
+            db.execute(
+                "INSERT INTO media_verification VALUES (1, 'id:1', 'rev', '1', '动漫', '/plex/a.mkv', "
+                "'节目', 'TV', 1, 2, 100, NULL, 115, 2, '等待')"
+            )
+        offline = read_offline_activity(path)
+        self.assertEqual(offline["pending_verifications"], 1)
+        self.assertEqual(offline["alternative_media"], [])
+        self.journal = await ActivityJournal.open(path)
+        record = await self.journal.next_due(115.0)
+        self.assertEqual(record.id, 1)
+        self.assertEqual(record.tmdb_id, "")
+        self.assertEqual(record.attempts, 2)
+        self.assertEqual(record.detail, "等待")
+        self.assertEqual(await self.journal.alternative_count(), 0)

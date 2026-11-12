@@ -130,6 +130,25 @@ class ActivityPageTests(unittest.TestCase):
         self.assertIn("节目 S01E02", rendered)
         self.assertIn("尚未在 Plex 中找到对应文件", rendered)
 
+    def test_other_versions_are_not_presented_as_confirmed_original_files(self) -> None:
+        media = {
+            "title": "节目",
+            "season_num": 1,
+            "episode_num": 2,
+            "expected_path": "/plex/节目/old.mkv",
+            "matched_path": "/plex/节目/new.mkv",
+            "section_title": "动漫",
+            "resolved_at": 1000.0,
+        }
+        rendered = json.dumps(
+            build_page({"ready": True, "alternative_media": [media]}, False),
+            ensure_ascii=False,
+        )
+        self.assertIn("Plex 已收录其他版本", rendered)
+        self.assertIn("原文件路径未确认", rendered)
+        self.assertIn("/plex/节目/old.mkv", rendered)
+        self.assertIn("/plex/节目/new.mkv", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,25 @@
+{
+  "CloudDrivePlexSync": {
+    "name": "TgToDrive Plex 增量同步",
+    "description": "通过 TgToDrive OpenAPI、持久化去重账本和历史对账触发 Plex 目录扫描，支持断点续跑与扫描队列恢复。",
+    "labels": "TgToDrive,OpenAPI,Plex,媒体库,增量扫描",
+    "version": "3.0.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png",
+    "author": "community",
+    "level": 1,
+    "system_version": ">=3.0.3,<4",
+    "history": {
+      "v3.0.0": "支持 MoviePilot V3 SDK、标准响应和插件分身，保留 TMDB 核验与现有数据。",
+      "v2.2.1": "按 TMDB ID、季集和文件路径核验 Plex 收录，单独记录同目录中的其他版本。",
+      "v2.2.0": "支持历史处理即时启停、游标缺口自动扩大回查、手动扫描 Plex 目录，以及分页日志和 Plex 入库确认；隔离新增与历史任务。",
+      "v2.1.0": "新增整理记录处理范围配置，默认仅新增，首次查询建立基线且不扫描历史；历史模式可选，切换时保留或恢复未提交的自动扫描任务。",
+      "v2.0.1": "补齐扫描入队、执行开始和请求提交成功的运行日志，打印 TTD 路径、实际 Plex 路径及媒体库信息，区分合并后的排队目录。",
+      "v2.0.0": "仅保留 TgToDrive OpenAPI → Plex；新增重叠回查、SQLite 去重账本、分批历史对账和执行中任务恢复，移除 CD2、Buffer、入库事件和旧 Cookie。",
+      "v1.3.1": "支持关闭 CloudDrive2 联动，仅通过 TgToDrive 整理历史、直接路径映射和 Plex 局部扫描运行。",
+      "v1.3.0": "新增 CD2 云端路径到 Plex 路径的直接映射并优先使用，未命中时兼容原有 MountPoint 推导；优化配置页响应式分区和窄屏布局。",
+      "v1.2.0": "TTD 提交改为入队、跳过、重试三态，避免永久不匹配记录重复报警和阻塞游标；配置页改为五类标签页并新增跳过策略。",
+      "v1.1.0": "新增 TgToDrive Cookie 增量轮询、持久化游标、分页补漏、认证退避与精确目录刷新。",
+      "v1.0.0": "支持 CD2 Pro 推送、Plex 局部扫描、事件防抖、手动补扫和可配置的动态 Buffer。"
+    }
+  }
+}

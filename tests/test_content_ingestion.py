@@ -189,6 +189,7 @@ class ContentIngestionTests(unittest.IsolatedAsyncioTestCase):
                     "media_type": "TV",
                     "season_num": 1,
                     "episode_num": 2,
+                    "tmdb_id": 258989,
                 }
             ]
         }
@@ -197,3 +198,34 @@ class ContentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed.revision, previous.revision)
         self.assertEqual(parsed.file_name, "new.mkv")
         self.assertEqual((parsed.season_num, parsed.episode_num), (1, 2))
+        self.assertEqual(parsed.tmdb_id, "258989")
+
+    def test_parser_uses_nested_tmdb_id_and_rejects_invalid_values(self) -> None:
+        payload = {
+            "records": [
+                {
+                    "id": 1,
+                    "target_path": "A",
+                    "extra": {"recognition": {"tmdb_id": "258989"}},
+                },
+                {"id": 2, "target_path": "B", "tmdb_id": "0"},
+                {"id": 3, "target_path": "C", "tmdb_id": True},
+            ]
+        }
+        self.assertEqual(
+            [record.tmdb_id for record in parse_history_payload(payload)],
+            ["258989", "", ""],
+        )
+
+    async def test_tmdb_id_survives_queue_round_trip(self) -> None:
+        entry = TTDHistoryRecord(
+            key="id:2", target_path="节目", file_name="E02.mkv", tmdb_id="258989"
+        )
+        await self.worker.submit_scan_directory("/cloud/节目", "ttd", records=[entry])
+        restarted = EventWorker(
+            self.worker.mapper, self.worker.plex, scans_per_second=10000
+        )
+        restarted.load_queue(self.worker.queue_snapshot())
+        restarted.on_submitted = self.submitted
+        await restarted.flush(force=True)
+        self.assertEqual(self.submitted.await_args.args[1][0].tmdb_id, "258989")

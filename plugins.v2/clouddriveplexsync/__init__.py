@@ -32,7 +32,7 @@ class CloudDrivePlexSync(_PluginBase):
     plugin_name = "TgToDrive Plex 增量同步"
     plugin_desc = "通过 TgToDrive 开放 API、历史对账和持久化队列触发 Plex 目录扫描。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/refresh2.png"
-    plugin_version = "2.2.0"
+    plugin_version = "2.2.1"
     plugin_author = "community"
     author_url = "https://github.com"
     plugin_config_prefix = "clouddriveplexsync_"

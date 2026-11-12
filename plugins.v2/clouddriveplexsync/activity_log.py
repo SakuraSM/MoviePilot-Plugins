@@ -174,6 +174,11 @@ class ActivitySnapshotReader(VerificationStoreMixin):
                 entry.to_dict() for entry in self._pending(DEFAULT_ACTIVITY_CAPACITY)
             ],
             "pending_verifications": self._pending_count(),
+            "alternative_media": [
+                entry.to_dict()
+                for entry in self._alternatives(DEFAULT_ACTIVITY_CAPACITY)
+            ],
+            "alternative_verifications": self._alternative_count(),
         }
 
 

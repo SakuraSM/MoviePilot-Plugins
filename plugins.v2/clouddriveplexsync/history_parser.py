@@ -169,6 +169,19 @@ def _optional_number(value: object) -> int | None:
     return None
 
 
+def _tmdb_id(item: dict[str, Any]) -> str:
+    raw = _first_value(item, ("tmdb_id", "tmdbId"))
+    if raw is None:
+        extra = item.get("extra")
+        recognition = extra.get("recognition") if isinstance(extra, dict) else None
+        if isinstance(recognition, dict):
+            raw = _first_value(recognition, ("tmdb_id", "tmdbId"))
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return ""
+    value = str(raw).strip()
+    return value if re.fullmatch(r"[1-9][0-9]{0,11}", value) else ""
+
+
 def parse_history_payload(payload: Any) -> list[TTDHistoryRecord]:
     """Parse known TgToDrive response shapes without depending on one release."""
 
@@ -211,6 +224,7 @@ def parse_history_payload(payload: Any) -> list[TTDHistoryRecord]:
                 episode_num=_optional_number(
                     _first_value(item, ("episode_num", "episodeNumber", "episode"))
                 ),
+                tmdb_id=_tmdb_id(item),
             )
         )
     return records

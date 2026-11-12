@@ -44,6 +44,7 @@ def build_media_hint(
         media_type=record.media_type,
         season_num=record.season_num,
         episode_num=record.episode_num,
+        tmdb_id=record.tmdb_id,
     )
 
 

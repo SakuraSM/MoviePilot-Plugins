@@ -90,6 +90,17 @@ def _pending_view(entry: dict[str, object]) -> dict[str, str]:
     return row
 
 
+def _alternative_view(entry: dict[str, object]) -> dict[str, str]:
+    row = _indexed_view(entry)
+    row["subtitle"] = (
+        f"发现其他版本于 {_timestamp(entry.get('resolved_at'))} · 原文件路径未确认"
+    )
+    row["detail"] = (
+        f"原路径：{entry.get('expected_path') or ''}\n其他版本：{entry.get('matched_path') or ''}"
+    )
+    return row
+
+
 def _page_window(rows: list[dict[str, str]]) -> dict[str, object]:
     page_count = (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE
     pages: list[dict[str, object]] = []
@@ -178,6 +189,7 @@ def build_page(
     activities = _entries(status.get("activities"))
     indexed = _entries(status.get("indexed_media"))
     pending = _entries(status.get("pending_media"))
+    alternatives = _entries(status.get("alternative_media"))
     recent = status.get("recent")
     if not activities and isinstance(recent, list):
         for item in reversed(recent):
@@ -244,6 +256,7 @@ def build_page(
                     "variant": "tonal",
                     "text": (
                         f"待确认：{status.get('pending_verifications', 0)} 条。"
+                        f"其他版本：{status.get('alternative_verifications', 0)} 条。"
                         "已确认表示 Plex 中找到对应文件路径；同名覆盖时不能仅凭路径确认文件版本。"
                         "这里只显示启用新版本后产生并完成核验的记录。"
                         "各列表最多显示最近 2000 条。"
@@ -256,6 +269,11 @@ def build_page(
         content.append(_page_window([_indexed_view(entry) for entry in indexed]))
     else:
         content.append({"component": "VCardText", "text": "暂无已确认收录的内容"})
+    if alternatives:
+        content.append({"component": "VCardTitle", "text": "Plex 已收录其他版本"})
+        content.append(
+            _page_window([_alternative_view(entry) for entry in alternatives])
+        )
     if pending:
         content.append({"component": "VCardTitle", "text": "等待 Plex 入库确认"})
         content.append(_page_window([_pending_view(entry) for entry in pending]))

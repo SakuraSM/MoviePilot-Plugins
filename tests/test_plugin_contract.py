@@ -12,7 +12,12 @@ from clouddriveplexsync.configuration import PluginSettings
 
 def install_moviepilot_stubs() -> None:
     class BaseModel:
-        pass
+        def __init__(self, **values):
+            for key in self.__class__.__annotations__:
+                setattr(self, key, values.get(key, getattr(self.__class__, key, None)))
+
+        def model_dump(self):
+            return {key: getattr(self, key) for key in self.__class__.__annotations__}
 
     class PluginBase:
         def __init__(self):
@@ -55,6 +60,10 @@ def install_moviepilot_stubs() -> None:
         ),
         "app.log": types.SimpleNamespace(logger=logger),
         "app.plugins": types.SimpleNamespace(_PluginBase=PluginBase),
+        "app.sdk": types.ModuleType("app.sdk"),
+        "app.sdk.plugin": types.SimpleNamespace(_PluginBase=PluginBase),
+        "app.sdk.services": types.SimpleNamespace(MediaServerHelper=MediaServerHelper),
+        "app.sdk.logging": types.SimpleNamespace(logger=logger),
     }
     for name, module in modules.items():
         sys.modules.setdefault(name, module)
@@ -75,7 +84,8 @@ class PluginContractTests(unittest.TestCase):
         module = load_plugin_module()
         plugin = module.CloudDrivePlexSync()
         form, defaults = plugin.get_form()
-        self.assertEqual(plugin.plugin_version, "2.2.0")
+        expected = "3.0.0" if _bootstrap.PLUGIN_GENERATION == "v3" else "2.2.1"
+        self.assertEqual(plugin.plugin_version, expected)
         for key in defaults:
             self.assertFalse(
                 any(
@@ -226,8 +236,18 @@ class PluginContractTests(unittest.TestCase):
 
     def test_disabled_status_is_available_without_background(self) -> None:
         plugin = load_plugin_module().CloudDrivePlexSync()
-        self.assertFalse(plugin.api_status()["data"]["ready"])
-        self.assertFalse(plugin.api_reconcile()["success"])
+        response = plugin.api_status()
+        data = (
+            response.data if _bootstrap.PLUGIN_GENERATION == "v3" else response["data"]
+        )
+        self.assertFalse(data["ready"])
+        reconcile = plugin.api_reconcile()
+        success = (
+            reconcile.success
+            if _bootstrap.PLUGIN_GENERATION == "v3"
+            else reconcile["success"]
+        )
+        self.assertFalse(success)
 
 
 if __name__ == "__main__":

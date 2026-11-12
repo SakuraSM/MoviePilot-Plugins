@@ -19,6 +19,8 @@ async def _activity_status(runtime: SyncRuntime) -> dict[str, object]:
         "indexed_media": [],
         "pending_media": [],
         "pending_verifications": 0,
+        "alternative_media": [],
+        "alternative_verifications": 0,
     }
     if runtime.activity:
         try:
@@ -32,6 +34,12 @@ async def _activity_status(runtime: SyncRuntime) -> dict[str, object]:
                 entry.to_dict() for entry in await runtime.activity.pending()
             ]
             result["pending_verifications"] = await runtime.activity.pending_count()
+            result["alternative_media"] = [
+                entry.to_dict() for entry in await runtime.activity.alternatives()
+            ]
+            result[
+                "alternative_verifications"
+            ] = await runtime.activity.alternative_count()
         except Exception as error:  # noqa: BLE001 - fall back to recent in-memory activity.
             message = f"读取日志与入库记录失败：{type(error).__name__}"
             if message != runtime.activity_error:

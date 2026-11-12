@@ -31,6 +31,7 @@ class MediaHint:
     media_type: str
     season_num: int | None = None
     episode_num: int | None = None
+    tmdb_id: str = ""
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> MediaHint:
@@ -58,6 +59,17 @@ class MediaHint:
             episode is not None and not isinstance(episode, int)
         ):
             raise ValueError("扫描队列季集编号无效")
+        tmdb_id = value.get("tmdb_id", "")
+        if not isinstance(tmdb_id, str) or (
+            tmdb_id
+            and (
+                not tmdb_id.isascii()
+                or not tmdb_id.isdigit()
+                or tmdb_id[0] == "0"
+                or len(tmdb_id) > 12
+            )
+        ):
+            raise ValueError("扫描队列 TMDB ID 无效")
         return cls(
             record_key=strings["record_key"],
             revision=strings["revision"],
@@ -67,6 +79,7 @@ class MediaHint:
             media_type=strings["media_type"],
             season_num=season,
             episode_num=episode,
+            tmdb_id=tmdb_id,
         )
 
 

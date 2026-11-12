@@ -74,6 +74,7 @@ class TTDHistoryRecord:
     media_type: str = ""
     season_num: int | None = None
     episode_num: int | None = None
+    tmdb_id: str = ""
 
     @property
     def revision(self) -> str:
